@@ -1,4 +1,5 @@
 export type MihomoInstanceId = string
+export type ProxyMode = 'Global' | 'Rule' | 'Direct' | 'Script'
 
 export type MihomoInstanceConfig = {
   id: MihomoInstanceId
@@ -37,6 +38,7 @@ export type CoreSummary = {
   profileId: string
   controllerPort: number
   mixedPort: number
+  mode: ProxyMode
   tunEnabled: boolean
   allowLan: boolean
   ipv6: boolean
@@ -96,6 +98,7 @@ export type MihomoConnection = {
     network?: string
     type?: string
     host?: string
+    sniffHost?: string
     destinationIP?: string
     destinationPort?: string | number
     sourceIP?: string

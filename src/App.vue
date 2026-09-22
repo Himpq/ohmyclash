@@ -1,15 +1,13 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import YamlEditor from './components/YamlEditor.vue'
-import { addSubscription, createCore, deleteCore, deleteProfile, getProfileContent, getSystemProxy, importProfile, listCores, listManagedInstances, listProfiles, MihomoClient, refreshProfile, revealProfile, saveProfile, setSystemProxy, updateCore } from './services/mihomo'
-import type { CoreSummary, ManagedInstanceStatus, MihomoConnection, MihomoInstanceConfig, MihomoInstanceId, MihomoProxy, MihomoRule, ProfileSummary } from './types/mihomo'
+import { addSubscription, createCore, deleteCore, deleteProfile, getProfileContent, getSystemProxy, importProfile, listCores, listManagedInstances, listProfiles, MihomoClient, refreshProfile, revealProfile, saveProfile, setSystemProxy, updateCore, updateCoreMode } from './services/mihomo'
+import type { CoreSummary, ManagedInstanceStatus, MihomoConnection, MihomoInstanceConfig, MihomoInstanceId, MihomoProxy, MihomoRule, ProfileSummary, ProxyMode } from './types/mihomo'
 
 type PageId = 'general' | 'proxies' | 'profiles' | 'cores' | 'logs' | 'connections' | 'settings' | 'feedback'
 type LogLevel = 'INFO' | 'WARN' | 'ERROR'
-type ProxyMode = 'Global' | 'Rule' | 'Direct' | 'Script'
 type ProxySortMode = 'natural' | 'delay'
 
-const storedProxyMode = localStorage.getItem('ohmyclash.proxyMode')
 const storedProxySortMode = localStorage.getItem('ohmyclash.proxySortMode')
 
 type ProxyNode = {
@@ -24,6 +22,12 @@ type ProxyGroup = {
   name: string
   current: string
   items: ProxyNode[]
+}
+
+type CoreDraft = {
+  name: string
+  controllerPort: string
+  mixedPort: string
 }
 
 type LogEntry = {
@@ -62,7 +66,8 @@ const startWithWindowsEnabled = ref(true)
 const darkThemeEnabled = ref(true)
 const rememberPageEnabled = ref(localStorage.getItem('ohmyclash.rememberPage') !== 'false')
 const trayOnCloseEnabled = ref(localStorage.getItem('ohmyclash.trayResident') === 'true')
-const proxyMode = ref<ProxyMode>(['Global', 'Rule', 'Direct', 'Script'].includes(storedProxyMode ?? '') ? storedProxyMode as ProxyMode : 'Global')
+const proxyMode = ref<ProxyMode>('Rule')
+const proxyModePending = ref(false)
 const proxySortMode = ref<ProxySortMode>(storedProxySortMode === 'delay' ? 'delay' : 'natural')
 const selectedProxy = ref('VPS-CF')
 const checkingProxies = ref<Record<string, true>>({})
@@ -85,6 +90,7 @@ const switchingProfileId = ref('')
 const coreMutationPending = ref(false)
 const profiles = ref<ProfileSummary[]>([])
 const cores = ref<CoreSummary[]>([])
+const coreDrafts = ref<Record<string, CoreDraft>>({})
 const showCoreDialog = ref(false)
 const coreName = ref('')
 const coreProfileId = ref('')
@@ -113,12 +119,14 @@ const contextMenu = ref<{ kind: 'profile' | 'core'; id: string; x: number; y: nu
 const deleteTarget = ref<DeleteTarget | null>(null)
 const deletingTarget = ref(false)
 const connectionSamples = new Map<string, { upload: number; download: number; sampledAt: number }>()
+let connectionsLoading = false
+let connectionLoadGeneration = 0
+let connectionLoadRequestId = 0
 
 const availableInstances = ref<MihomoInstanceConfig[]>([])
 const managedInstances = ref<ManagedInstanceStatus[]>([])
 const uptimeClock = ref(Date.now())
 
-watch(proxyMode, (value) => localStorage.setItem('ohmyclash.proxyMode', value))
 watch(proxySortMode, (value) => localStorage.setItem('ohmyclash.proxySortMode', value))
 watch(activeInstanceId, (value) => localStorage.setItem('ohmyclash.activeInstanceId', value))
 watch(selectedProfile, (value) => localStorage.setItem('ohmyclash.selectedProfile', value))
@@ -253,11 +261,20 @@ const visibleConnections = computed(() => {
   const filtered = keyword ? connections.value.filter((connection) =>
     [connection.host, connection.address, connection.process, connection.policy, connection.network, connection.inbound].some((value) => value.toLowerCase().includes(keyword)),
   ) : connections.value
-  return [...filtered].sort((left, right) => {
-    if (connectionSort.value === 'time') return left.startedAt - right.startedAt
-    return right[connectionSort.value] - left[connectionSort.value]
-  })
+  return filtered
+    .map((connection, index) => ({ connection, index }))
+    .sort((left, right) => {
+      if (connectionSort.value === 'time') return left.connection.startedAt - right.connection.startedAt
+      const leftValue = finiteConnectionMetric(left.connection[connectionSort.value])
+      const rightValue = finiteConnectionMetric(right.connection[connectionSort.value])
+      return rightValue - leftValue || left.index - right.index
+    })
+    .map(({ connection }) => connection)
 })
+
+function finiteConnectionMetric(value: number) {
+  return Number.isFinite(value) ? Math.max(0, value) : 0
+}
 
 const connectionSorts: Array<{ id: ConnectionSort; label: string }> = [
   { id: 'uploadSpeed', label: '上传速度' },
@@ -408,7 +425,23 @@ async function loadProfiles() {
 
 async function loadCores() {
   try {
-    cores.value = (await listCores()).cores
+    const nextCores = (await listCores()).cores
+    const previousCores = cores.value
+    const nextDrafts = Object.fromEntries(nextCores.map((core) => [core.id, {
+      name: core.name,
+      controllerPort: String(core.controllerPort),
+      mixedPort: String(core.mixedPort),
+    }])) as Record<string, CoreDraft>
+    for (const previousCore of previousCores) {
+      const draft = coreDrafts.value[previousCore.id]
+      if (!draft) continue
+      const hasUnsentChange = draft.name.trim() !== previousCore.name || draft.controllerPort.trim() !== String(previousCore.controllerPort) || draft.mixedPort.trim() !== String(previousCore.mixedPort)
+      if (hasUnsentChange && nextDrafts[previousCore.id]) nextDrafts[previousCore.id] = draft
+    }
+    cores.value = nextCores
+    const selectedCore = nextCores.find((core) => core.id === activeInstanceId.value)
+    if (selectedCore) proxyMode.value = selectedCore.mode
+    coreDrafts.value = nextDrafts
     await loadSystemProxy()
   } catch (error) {
     showToast(readableError(error, '无法读取核心列表'))
@@ -470,11 +503,86 @@ async function patchCore(core: CoreSummary, changes: Record<string, unknown>) {
   }
 }
 
-function updateCoreField(core: CoreSummary, key: 'name' | 'controllerPort' | 'mixedPort', event: Event) {
+function coreDraft(core: CoreSummary): CoreDraft {
+  return coreDrafts.value[core.id] ?? {
+    name: core.name,
+    controllerPort: String(core.controllerPort),
+    mixedPort: String(core.mixedPort),
+  }
+}
+
+function updateCoreDraft(core: CoreSummary, key: keyof CoreDraft, event: Event) {
   const input = event.target as HTMLInputElement
-  const value = key === 'name' ? input.value.trim() : Number(input.value)
-  if (value === '' || (typeof value === 'number' && !Number.isInteger(value))) return
-  void patchCore(core, { [key]: value })
+  const current = coreDraft(core)
+  coreDrafts.value = {
+    ...coreDrafts.value,
+    [core.id]: { ...current, [key]: input.value },
+  }
+}
+
+function resetCoreDraft(core: CoreSummary) {
+  coreDrafts.value = {
+    ...coreDrafts.value,
+    [core.id]: {
+      name: core.name,
+      controllerPort: String(core.controllerPort),
+      mixedPort: String(core.mixedPort),
+    },
+  }
+}
+
+function coreDraftDirty(core: CoreSummary) {
+  const draft = coreDraft(core)
+  return draft.name.trim() !== core.name || draft.controllerPort.trim() !== String(core.controllerPort) || draft.mixedPort.trim() !== String(core.mixedPort)
+}
+
+function parseCorePort(value: string, label: string): number {
+  const normalized = value.trim()
+  if (!/^\d+$/.test(normalized)) throw new Error(`${label}必须是完整的数字`)
+  const port = Number(normalized)
+  if (!Number.isInteger(port) || port < 1024 || port > 65535) {
+    throw new Error(`${label}必须在 1024 到 65535 之间`)
+  }
+  return port
+}
+
+async function saveCoreDraft(core: CoreSummary) {
+  if (coreMutationPending.value || !coreDraftDirty(core)) return
+  const draft = coreDraft(core)
+  const name = draft.name.trim()
+  let controllerPort: number
+  let mixedPort: number
+  try {
+    if (!name) throw new Error('核心名称不能为空')
+    controllerPort = parseCorePort(draft.controllerPort, '控制端口')
+    mixedPort = parseCorePort(draft.mixedPort, '混合端口')
+    if (controllerPort === mixedPort) throw new Error('控制端口和混合端口不能相同')
+    const usedByOtherCore = cores.value.some((other) => other.id !== core.id && (
+      [other.controllerPort, other.mixedPort].includes(controllerPort) ||
+      [other.controllerPort, other.mixedPort].includes(mixedPort)
+    ))
+    if (usedByOtherCore) throw new Error('端口已被其他核心使用')
+  } catch (error) {
+    showToast(readableError(error, '核心设置无效'))
+    return
+  }
+
+  coreMutationPending.value = true
+  try {
+    const response = await updateCore(core.id, { name, controllerPort, mixedPort })
+    cores.value = cores.value.map((item) => item.id === response.core.id ? response.core : item)
+    coreDrafts.value = {
+      ...coreDrafts.value,
+      [core.id]: { name, controllerPort: String(controllerPort), mixedPort: String(mixedPort) },
+    }
+    applyManagedInstances(response.instances)
+    await loadProxyData(false)
+    showToast(`${name} 的名称和端口已保存`)
+  } catch (error) {
+    showToast(readableError(error, '核心修改保存失败，已保持原配置'))
+  } finally {
+    coreMutationPending.value = false
+  }
 }
 
 async function loadProxyData(showToastMessages = true): Promise<boolean> {
@@ -515,6 +623,11 @@ async function selectInstance(instanceId: MihomoInstanceId) {
   if (activeInstanceId.value === instanceId && backendStatus.value === 'loading') return
   showInstanceMenu.value = false
   activeInstanceId.value = instanceId
+  const selectedCore = cores.value.find((core) => core.id === instanceId)
+  if (selectedCore) proxyMode.value = selectedCore.mode
+  connectionLoadGeneration += 1
+  connectionLoadRequestId += 1
+  connectionsLoading = false
   resetProxyTesting()
   connectionSamples.clear()
   connections.value = []
@@ -527,13 +640,21 @@ async function selectInstance(instanceId: MihomoInstanceId) {
   if (activePage.value === 'connections') await loadConnections()
 }
 
-function selectProxyMode(mode: ProxyMode) {
-  proxyMode.value = mode
-  if (backendStatus.value === 'connected') {
-    showToast(`已切换到 ${mode} 模式`)
-    return
+async function selectProxyMode(mode: ProxyMode) {
+  if (proxyModePending.value || mode === proxyMode.value || !activeInstanceId.value) return
+  const previousMode = proxyMode.value
+  proxyModePending.value = true
+  try {
+    const response = await updateCoreMode(activeInstanceId.value, mode)
+    cores.value = cores.value.map((core) => core.id === response.core.id ? response.core : core)
+    proxyMode.value = response.core.mode
+    showToast(`${activeInstance.value.name} 已切换到 ${mode} 模式`)
+  } catch (error) {
+    proxyMode.value = previousMode
+    showToast(readableError(error, '核心模式切换失败'))
+  } finally {
+    proxyModePending.value = false
   }
-  showToast(`已切换到 ${mode} 模式，当前尚未连接核心`)
 }
 
 async function selectProxy(name: string, groupName: string) {
@@ -918,7 +1039,7 @@ async function loadCoreLogs() {
 }
 
 function formatTraffic(bytes = 0) {
-  if (bytes < 1024) return `${bytes} B`
+  if (bytes < 1024) return `${bytes < 10 ? bytes.toFixed(1) : Math.round(bytes)} B`
   if (bytes < 1024 ** 2) return `${(bytes / 1024).toFixed(1)} KB`
   if (bytes < 1024 ** 3) return `${(bytes / 1024 ** 2).toFixed(2)} MB`
   return `${(bytes / 1024 ** 3).toFixed(2)} GB`
@@ -947,7 +1068,7 @@ function mapConnection(connection: MihomoConnection, sampledAt: number): Connect
   connectionSamples.set(connection.id, { upload, download, sampledAt })
   return {
     id: connection.id,
-    host: metadata.host || destination || '未知目标',
+    host: metadata.host || metadata.sniffHost || destination || '未知目标',
     address: destination || '-',
     network: (metadata.network || '-').toUpperCase(),
     inbound: metadata.type || '-',
@@ -956,16 +1077,24 @@ function mapConnection(connection: MihomoConnection, sampledAt: number): Connect
     startedAt: connection.start ? new Date(connection.start).getTime() : sampledAt,
     upload,
     download,
-    uploadSpeed: elapsed ? (upload - previous!.upload) / elapsed : 0,
-    downloadSpeed: elapsed ? (download - previous!.download) / elapsed : 0,
+    uploadSpeed: elapsed ? finiteConnectionMetric((upload - previous!.upload) / elapsed) : 0,
+    downloadSpeed: elapsed ? finiteConnectionMetric((download - previous!.download) / elapsed) : 0,
   }
 }
 
 async function loadConnections() {
-  if (connectionsPaused.value) return
+  if (connectionsPaused.value || connectionsLoading) return
+  const generation = connectionLoadGeneration
+  const requestId = ++connectionLoadRequestId
+  connectionsLoading = true
   try {
-    await ensureActiveInstance()
-    const response = await getMihomoClient(activeInstanceId.value).getConnections()
+    if (!activeInstanceId.value || !availableInstances.value.some((instance) => instance.id === activeInstanceId.value)) {
+      await ensureActiveInstance()
+    }
+    if (generation !== connectionLoadGeneration || requestId !== connectionLoadRequestId) return
+    const instanceId = activeInstanceId.value
+    const response = await getMihomoClient(instanceId).getConnections()
+    if (generation !== connectionLoadGeneration || requestId !== connectionLoadRequestId || instanceId !== activeInstanceId.value) return
     const sampledAt = Date.now()
     connections.value = (response.connections ?? []).map((connection) => mapConnection(connection, sampledAt))
     const activeIds = new Set(connections.value.map((connection) => connection.id))
@@ -975,8 +1104,11 @@ async function loadConnections() {
     uploadRate.value = connections.value.reduce((sum, connection) => sum + connection.uploadSpeed, 0)
     downloadRate.value = connections.value.reduce((sum, connection) => sum + connection.downloadSpeed, 0)
   } catch (error) {
+    if (generation !== connectionLoadGeneration || requestId !== connectionLoadRequestId) return
     connections.value = []
     backendError.value = readableError(error, '无法读取核心连接')
+  } finally {
+    if (requestId === connectionLoadRequestId) connectionsLoading = false
   }
 }
 
@@ -1054,6 +1186,7 @@ function windowAction(label: string) {
       <symbol id="icon-minimize" viewBox="0 0 24 24"><path d="M5 12h14v1.8H5z" /></symbol>
       <symbol id="icon-maximize" viewBox="0 0 24 24"><path d="M5 5h14v14H5V5Zm1.8 1.8v10.4h10.4V6.8H6.8Z" /></symbol>
       <symbol id="icon-close" viewBox="0 0 24 24"><path d="m6.4 5.1 6 6 6-6 1.3 1.3-6 6 6 6-1.3 1.3-6-6-6 6-1.3-1.3 6-6-6-6 1.3-1.3Z" /></symbol>
+      <symbol id="icon-connection-close" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9.25" /><path d="m8.5 8.5 7 7m0-7-7 7" /></symbol>
       <symbol id="icon-nav-general" viewBox="0 0 24 24"><path d="M12 19V5m0 0L6.8 10.2M12 5l5.2 5.2" /></symbol>
       <symbol id="icon-nav-proxies" viewBox="0 0 24 24"><circle cx="6" cy="12" r="2.2" /><circle cx="18" cy="6" r="2.2" /><circle cx="18" cy="18" r="2.2" /><path d="m8 11 7.8-4M8 13l7.8 4" /></symbol>
       <symbol id="icon-nav-profiles" viewBox="0 0 24 24"><path d="M6 3.8h8l4 4V20H6V3.8Zm8 0v4h4M8.8 12h6.4M8.8 15.5h6.4" /></symbol>
@@ -1144,7 +1277,7 @@ function windowAction(label: string) {
             <button class="proxy-instance-refresh" title="刷新核心数据" :disabled="backendStatus === 'loading'" @click="() => loadProxyData()"><svg><use href="#icon-refresh" /></svg></button>
           </div>
           <div class="proxy-mode-tabs" role="tablist" aria-label="代理模式">
-            <button v-for="mode in proxyModes" :key="mode.id" class="proxy-mode-tab" :class="{ active: proxyMode === mode.id }" role="tab" :aria-selected="proxyMode === mode.id" @click="selectProxyMode(mode.id)">{{ mode.label }}</button>
+            <button v-for="mode in proxyModes" :key="mode.id" class="proxy-mode-tab" :class="{ active: proxyMode === mode.id }" role="tab" :aria-selected="proxyMode === mode.id" :disabled="proxyModePending" @click="selectProxyMode(mode.id)">{{ mode.label }}</button>
           </div>
 
           <div v-if="visibleProxyGroups.length === 0" class="proxy-data-empty"><strong>{{ backendStatusLabel }}</strong><p>{{ backendError || '先在配置页导入本地 YAML 或添加订阅，核心启动后这里会显示真实代理组。' }}</p><button class="page-button secondary" @click="selectPage('profiles')">前往配置</button></div>
@@ -1202,13 +1335,14 @@ function windowAction(label: string) {
         </section>
 
         <section v-else-if="activePage === 'cores'" class="screen-page">
-          <div class="screen-heading"><div><h2>核心</h2><p>多个 Mihomo 核心并行运行，系统代理仅绑定其中一个核心</p></div><button class="page-button" @click="coreProfileId = profiles[0]?.id ?? ''; showCoreDialog = true">创建核心</button></div>
+          <div class="screen-heading"><div><h2>核心</h2><p>多个 Mihomo 核心并行运行，系统代理仅绑定其中一个核心；名称和端口修改后统一保存</p></div><button class="page-button" @click="coreProfileId = profiles[0]?.id ?? ''; showCoreDialog = true">创建核心</button></div>
           <div class="core-list">
             <article v-for="core in cores" :key="core.id" class="core-card" :class="{ active: activeInstanceId === core.id }" @contextmenu.prevent="openContextMenu($event, 'core', core.id)">
               <div class="core-card-heading"><button @click="selectInstance(core.id)"><strong>{{ core.name }}</strong><small>{{ profiles.find((profile) => profile.id === core.profileId)?.name ?? core.profileId }}</small></button><span>{{ core.mixedPort }}</span></div>
-              <label class="core-input-row"><span>名称</span><input :value="core.name" maxlength="80" @change="updateCoreField(core, 'name', $event)" /></label>
-              <label class="core-input-row"><span>控制端口</span><input :value="core.controllerPort" type="number" min="1024" max="65535" @change="updateCoreField(core, 'controllerPort', $event)" /></label>
-              <label class="core-input-row"><span>混合端口</span><input :value="core.mixedPort" type="number" min="1024" max="65535" @change="updateCoreField(core, 'mixedPort', $event)" /></label>
+              <label class="core-input-row"><span>名称</span><input :value="coreDraft(core).name" maxlength="80" autocomplete="off" @input="updateCoreDraft(core, 'name', $event)" @keydown.enter.prevent="saveCoreDraft(core)" @keydown.esc="resetCoreDraft(core)" /></label>
+              <label class="core-input-row"><span>控制端口</span><input :value="coreDraft(core).controllerPort" type="text" inputmode="numeric" autocomplete="off" @input="updateCoreDraft(core, 'controllerPort', $event)" @keydown.enter.prevent="saveCoreDraft(core)" @keydown.esc="resetCoreDraft(core)" /></label>
+              <label class="core-input-row"><span>混合端口</span><input :value="coreDraft(core).mixedPort" type="text" inputmode="numeric" autocomplete="off" @input="updateCoreDraft(core, 'mixedPort', $event)" @keydown.enter.prevent="saveCoreDraft(core)" @keydown.esc="resetCoreDraft(core)" /></label>
+              <div class="core-port-actions"><span v-if="coreDraftDirty(core)">名称或端口修改尚未保存</span><button class="core-port-save" :disabled="coreMutationPending || !coreDraftDirty(core)" @click.stop="saveCoreDraft(core)">{{ coreMutationPending ? '保存中…' : '保存修改' }}</button></div>
               <div class="core-setting-row"><span>允许局域网</span><button @click="patchCore(core, { allowLan: !core.allowLan })"><span class="switch" :class="{ on: core.allowLan }"><i /></span></button></div>
               <div class="core-setting-row"><span>IPv6</span><button @click="patchCore(core, { ipv6: !core.ipv6 })"><span class="switch" :class="{ on: core.ipv6 }"><i /></span></button></div>
               <div class="core-setting-row"><span>TUN 模式</span><button @click="patchCore(core, { tunEnabled: !core.tunEnabled })"><span class="switch" :class="{ on: core.tunEnabled }"><i /></span></button></div>
@@ -1230,7 +1364,7 @@ function windowAction(label: string) {
           <div class="connection-toolbar"><div class="connection-sorts"><button v-for="sort in connectionSorts" :key="sort.id" :class="{ active: connectionSort === sort.id }" @click="connectionSort = sort.id">{{ sort.label }}</button></div><button class="page-button close-all-button" :disabled="connections.length === 0" @click="closeAllConnections">关闭全部</button></div>
           <div class="connections-panel">
             <div v-if="visibleConnections.length === 0" class="panel-empty">暂无匹配连接</div>
-            <div v-for="connection in visibleConnections" :key="connection.id" class="connection-line"><div class="connection-detail"><strong>{{ connection.host }}</strong><small v-if="connection.address !== connection.host">{{ connection.address }}</small><div class="connection-tags"><span class="tag-network">{{ connection.network }}</span><span class="tag-inbound">{{ connection.inbound }}</span><span class="tag-process">{{ connection.process }}</span><span class="tag-policy">{{ connection.policy }}</span><span class="tag-age">{{ connectionAge(connection.startedAt) }}</span><span v-if="connection.uploadSpeed || connection.downloadSpeed" class="tag-speed">↑{{ formatRate(connection.uploadSpeed) }} ↓{{ formatRate(connection.downloadSpeed) }}</span></div></div><button title="关闭连接" @click="closeConnection(connection.id)"><svg class="row-icon close-icon"><use href="#icon-close" /></svg></button></div>
+            <div v-for="connection in visibleConnections" :key="connection.id" class="connection-line"><div class="connection-detail"><strong>{{ connection.host }}</strong><div class="connection-tags"><span class="tag-network">{{ connection.network }}</span><span class="tag-inbound">{{ connection.inbound }}</span><span class="tag-process">{{ connection.process }}</span><span class="tag-policy">{{ connection.policy }}</span><span class="tag-age">{{ connectionAge(connection.startedAt) }}</span><span v-if="connection.uploadSpeed || connection.downloadSpeed" class="tag-speed">↑{{ formatRate(connection.uploadSpeed) }} ↓{{ formatRate(connection.downloadSpeed) }}</span></div></div><button title="关闭连接" aria-label="关闭连接" @click="closeConnection(connection.id)"><svg class="row-icon close-icon"><use href="#icon-connection-close" /></svg></button></div>
           </div>
         </section>
 

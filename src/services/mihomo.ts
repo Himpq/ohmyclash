@@ -10,8 +10,10 @@ import type {
   ProfileSummary,
   ProfilesResponse,
   CoresResponse,
+  CoreSummary,
   CoreMutationResponse,
   SystemProxyStatus,
+  ProxyMode,
 } from '../types/mihomo'
 
 export class MihomoApiError extends Error {
@@ -128,6 +130,13 @@ export async function createCore(name: string, profileId: string, backendUrl = '
 
 export async function updateCore(coreId: string, changes: Record<string, unknown>, backendUrl = 'http://127.0.0.1:17890'): Promise<CoreMutationResponse> {
   return requestBackend<CoreMutationResponse>(`/api/cores/${encodeURIComponent(coreId)}`, backendUrl, { method: 'PUT', body: JSON.stringify(changes) })
+}
+
+export async function updateCoreMode(coreId: string, mode: ProxyMode, backendUrl = 'http://127.0.0.1:17890'): Promise<{ core: CoreSummary }> {
+  return requestBackend<{ core: CoreSummary }>(`/api/cores/${encodeURIComponent(coreId)}/mode`, backendUrl, {
+    method: 'PUT',
+    body: JSON.stringify({ mode }),
+  })
 }
 
 export async function deleteCore(coreId: string, backendUrl = 'http://127.0.0.1:17890'): Promise<CoreMutationResponse> {
