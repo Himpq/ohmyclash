@@ -19,7 +19,7 @@ backend/              Python API、核心生命周期和 Windows 系统代理
 desktop/              PyWebView 桌面启动器和托盘逻辑
 src/                  Vue 前端
 WebViewUI/            PyWebView 窗口壳子，Git 子模块
-runtime/core/         Mihomo 核心程序
+runtime/core/         本地 Mihomo 核心程序（不提交到 Git）
 data/                 本机配置、订阅、日志和运行时缓存，不提交到 Git
 ```
 
@@ -30,7 +30,7 @@ data/                 本机配置、订阅、日志和运行时缓存，不提�
 - Node.js 和 npm
 - WebView2 Runtime
 
-仓库已经包含 `runtime/core/mihomo.exe`。如果使用其他版本的 Mihomo，请替换该文件，并确认版本与配置格式兼容。
+仓库不包含 Mihomo 二进制。启动前请将兼容版本命名为 `mihomo.exe` 并放入 `runtime/core/`。如果使用其他版本，请确认版本与配置格式兼容；核心二进制应通过可信来源或单独的发布流程分发。
 
 ## 安装
 
