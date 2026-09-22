@@ -14,7 +14,7 @@ export type ManagedInstanceStatus = {
   exitCode: number | null
   startedAt: string | null
   controllerUrl: string
-  logs: string[]
+  logs?: string[]
 }
 
 export type ManagedInstancesResponse = {

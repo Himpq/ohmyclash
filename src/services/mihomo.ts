@@ -63,6 +63,11 @@ export class MihomoClient {
     await this.request('/runtime-logs', { method: 'DELETE' })
   }
 
+  async getRuntimeLogs(): Promise<string[]> {
+    const response = await this.request<{ logs: string[] }>('/runtime-logs')
+    return response.logs
+  }
+
   async selectProxy(groupName: string, proxyName: string): Promise<void> {
     await this.request(`/proxies/${encodeURIComponent(groupName)}`, {
       method: 'PUT',

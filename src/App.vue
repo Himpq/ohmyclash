@@ -120,6 +120,8 @@ const deleteTarget = ref<DeleteTarget | null>(null)
 const deletingTarget = ref(false)
 const connectionSamples = new Map<string, { upload: number; download: number; sampledAt: number }>()
 let connectionsLoading = false
+let logsLoading = false
+let statusLoading = false
 let connectionLoadGeneration = 0
 let connectionLoadRequestId = 0
 
@@ -463,11 +465,15 @@ function applyManagedInstances(instances: ManagedInstanceStatus[]) {
 }
 
 async function pollManagedInstances() {
+  if (statusLoading) return
+  statusLoading = true
   try {
     await refreshManagedInstances()
   } catch (error) {
     managedInstances.value = []
     backendError.value = readableError(error, '无法刷新核心状态')
+  } finally {
+    statusLoading = false
   }
 }
 
@@ -1018,11 +1024,6 @@ function onLogScroll() {
   logStickToBottom.value = panel.scrollHeight - panel.scrollTop - panel.clientHeight < 24
 }
 
-function applyRuntimeLogs(instances: ManagedInstanceStatus[]) {
-  const instance = instances.find((item) => item.id === activeInstanceId.value)
-  logs.value = (instance?.logs ?? []).map(parseCoreLog)
-}
-
 async function ensureActiveInstance(): Promise<ManagedInstanceStatus[]> {
   const instances = await refreshManagedInstances()
   if (!availableInstances.value.length) throw new Error('当前没有可用核心')
@@ -1030,11 +1031,21 @@ async function ensureActiveInstance(): Promise<ManagedInstanceStatus[]> {
 }
 
 async function loadCoreLogs() {
+  if (logsLoading) return
+  logsLoading = true
   try {
-    applyRuntimeLogs(await ensureActiveInstance())
+    if (!activeInstanceId.value || !availableInstances.value.some((instance) => instance.id === activeInstanceId.value)) {
+      await ensureActiveInstance()
+    }
+    const instanceId = activeInstanceId.value
+    const lines = await getMihomoClient(instanceId).getRuntimeLogs()
+    if (instanceId !== activeInstanceId.value) return
+    logs.value = lines.map(parseCoreLog)
   } catch (error) {
     logs.value = []
     backendError.value = readableError(error, '无法读取核心日志')
+  } finally {
+    logsLoading = false
   }
 }
 
@@ -1096,13 +1107,27 @@ async function loadConnections() {
     const response = await getMihomoClient(instanceId).getConnections()
     if (generation !== connectionLoadGeneration || requestId !== connectionLoadRequestId || instanceId !== activeInstanceId.value) return
     const sampledAt = Date.now()
-    connections.value = (response.connections ?? []).map((connection) => mapConnection(connection, sampledAt))
-    const activeIds = new Set(connections.value.map((connection) => connection.id))
+    const nextConnections: Connection[] = []
+    const activeIds = new Set<string>()
+    let nextUploadRate = 0
+    let nextDownloadRate = 0
+    let calculatedUploadTotal = 0
+    let calculatedDownloadTotal = 0
+    for (const rawConnection of response.connections ?? []) {
+      const connection = mapConnection(rawConnection, sampledAt)
+      nextConnections.push(connection)
+      activeIds.add(connection.id)
+      nextUploadRate += connection.uploadSpeed
+      nextDownloadRate += connection.downloadSpeed
+      calculatedUploadTotal += connection.upload
+      calculatedDownloadTotal += connection.download
+    }
+    connections.value = nextConnections
     for (const id of connectionSamples.keys()) if (!activeIds.has(id)) connectionSamples.delete(id)
-    uploadTotal.value = response.uploadTotal ?? connections.value.reduce((sum, connection) => sum + connection.upload, 0)
-    downloadTotal.value = response.downloadTotal ?? connections.value.reduce((sum, connection) => sum + connection.download, 0)
-    uploadRate.value = connections.value.reduce((sum, connection) => sum + connection.uploadSpeed, 0)
-    downloadRate.value = connections.value.reduce((sum, connection) => sum + connection.downloadSpeed, 0)
+    uploadTotal.value = response.uploadTotal ?? calculatedUploadTotal
+    downloadTotal.value = response.downloadTotal ?? calculatedDownloadTotal
+    uploadRate.value = nextUploadRate
+    downloadRate.value = nextDownloadRate
   } catch (error) {
     if (generation !== connectionLoadGeneration || requestId !== connectionLoadRequestId) return
     connections.value = []
@@ -1154,12 +1179,14 @@ onMounted(() => {
   if (activePage.value !== 'general') selectPage(activePage.value)
   void syncTrayResident(trayOnCloseEnabled.value).catch((error) => showToast(readableError(error, '无法初始化托盘')))
   window.addEventListener('pointerdown', closeContextMenu)
+  document.addEventListener('visibilitychange', refreshVisiblePage)
   liveDataTimer = window.setInterval(() => {
+    if (document.hidden) return
     if (activePage.value === 'logs') void loadCoreLogs()
     if (activePage.value === 'connections') void loadConnections()
-  }, 1500)
+  }, 2000)
   uptimeTimer = window.setInterval(() => { uptimeClock.value = Date.now() }, 1000)
-  statusTimer = window.setInterval(() => { void pollManagedInstances() }, 5000)
+  statusTimer = window.setInterval(() => { if (!document.hidden) void pollManagedInstances() }, 10000)
 })
 onBeforeUnmount(() => {
   if (liveDataTimer) window.clearInterval(liveDataTimer)
@@ -1167,6 +1194,13 @@ onBeforeUnmount(() => {
   if (statusTimer) window.clearInterval(statusTimer)
   window.removeEventListener('pointerdown', closeContextMenu)
 })
+
+function refreshVisiblePage() {
+  if (document.hidden) return
+  void pollManagedInstances()
+  if (activePage.value === 'logs') void loadCoreLogs()
+  if (activePage.value === 'connections') void loadConnections()
+}
 
 function closeContextMenu() {
   contextMenu.value = null

@@ -257,12 +257,12 @@ class MihomoManager:
         self._process_job.close()
         logger.info("Mihomo process job closed")
 
-    def status(self, instance_id: str) -> dict[str, Any]:
+    def status(self, instance_id: str, include_logs: bool = False) -> dict[str, Any]:
         spec = self._get_spec(instance_id)
         with self._lock:
             managed = self._processes.get(instance_id)
             running = bool(managed and managed.process.poll() is None)
-            return {
+            result = {
                 "id": spec.id,
                 "name": spec.name,
                 "running": running,
@@ -270,8 +270,10 @@ class MihomoManager:
                 "exitCode": None if running or not managed else managed.process.returncode,
                 "startedAt": datetime.fromtimestamp(managed.started_at, timezone.utc).isoformat() if managed else None,
                 "controllerUrl": spec.controller_url,
-                "logs": list(managed.logs)[-80:] if managed else [],
             }
+            if include_logs:
+                result["logs"] = list(managed.logs)[-80:] if managed else []
+            return result
 
     def statuses(self) -> list[dict[str, Any]]:
         return [self.status(instance_id) for instance_id in self.instance_ids]
@@ -283,6 +285,12 @@ class MihomoManager:
             if managed:
                 managed.logs.clear()
         return self.status(instance_id)
+
+    def runtime_logs(self, instance_id: str) -> list[str]:
+        self._get_spec(instance_id)
+        with self._lock:
+            managed = self._processes.get(instance_id)
+            return list(managed.logs)[-80:] if managed else []
 
     def request(
         self,

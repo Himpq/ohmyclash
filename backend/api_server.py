@@ -210,6 +210,9 @@ class BackendHandler(BaseHTTPRequestHandler):
             if method == "GET" and tail == "/status":
                 self._json(200, self.server.manager.status(instance_id))
                 return
+            if method == "GET" and tail == "/runtime-logs":
+                self._json(200, {"logs": self.server.manager.runtime_logs(instance_id)})
+                return
             if method == "DELETE" and tail == "/runtime-logs":
                 self._json(200, self.server.manager.clear_logs(instance_id))
                 return
@@ -338,4 +341,4 @@ class BackendServer(ThreadingHTTPServer):
 
     @staticmethod
     def log(message: str) -> None:
-        logger.info("%s", message)
+        logger.debug("%s", message)
