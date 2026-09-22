@@ -48,7 +48,7 @@ html.wvu-titlebar-ready .cfw-window > .titlebar { display: none; }
 .status-dot.red { background: #e14d52; }
 .status-dot.idle { background: #8f8d98; }
 
-.content-area { min-width: 0; flex: 1; overflow: hidden auto; background: #292838; scrollbar-color: #777583 #302f3e; scrollbar-width: auto; }
+.content-area { min-width: 0; flex: 1; overflow: hidden auto; background: #292838; scrollbar-color: #777583 #302f3e; scrollbar-gutter: stable; scrollbar-width: auto; }
 .content-area::-webkit-scrollbar { width: 14px; height: 14px; }
 .content-area::-webkit-scrollbar-track { background: #302f3e; }
 .content-area::-webkit-scrollbar-thumb { background: #777583; border: 3px solid #302f3e; border-radius: 8px; }
@@ -206,7 +206,7 @@ html.wvu-titlebar-ready .cfw-window > .titlebar { display: none; }
 
 .log-panel, .connections-panel, .simple-settings { background: #333242; border: 1px solid #3f3e4d; }
 .log-page { height: 100%; min-height: 0; display: flex; flex-direction: column; }
-.log-panel { min-height: 0; flex: 1; overflow: auto; padding: 7px 13px; scrollbar-color: #777583 #302f3e; scrollbar-width: auto; }
+.log-panel { min-height: 0; flex: 1; overflow: auto; padding: 7px 13px; scrollbar-color: #777583 #302f3e; scrollbar-gutter: stable; scrollbar-width: auto; }
 .log-panel::-webkit-scrollbar { width: 13px; }
 .log-panel::-webkit-scrollbar-track { background: #302f3e; }
 .log-panel::-webkit-scrollbar-thumb { background: #777583; border: 3px solid #302f3e; border-radius: 8px; }
@@ -223,7 +223,7 @@ html.wvu-titlebar-ready .cfw-window > .titlebar { display: none; }
 .heading-count { color: #8c8a98; font-size: 17px; }
 .search-box { width: 190px; padding: 9px 11px; color: #e5e3e7; background: #333242; border: 1px solid #4a4957; outline: none; font-size: 12px; }
 .search-box::placeholder { color: #878592; }
-.connections-page { padding-top: 10px; }
+.connections-page { display: flex; height: 100%; min-height: 0; flex-direction: column; padding-top: 10px; }
 .connections-heading { display: grid; grid-template-columns: auto minmax(130px, 1fr) auto auto; gap: 10px; align-items: center; }
 .connections-heading h2 { margin: 0; color: #f4f2f4; font-size: 21px; font-weight: 400; white-space: nowrap; }
 .connection-totals { color: #eeecef; font-size: 13px; white-space: nowrap; }
@@ -234,8 +234,8 @@ html.wvu-titlebar-ready .cfw-window > .titlebar { display: none; }
 .connection-sorts { display: flex; min-width: 0; gap: 6px; overflow-x: auto; }
 .connection-sorts button { flex: 0 0 auto; padding: 6px 8px; color: #e7e5e9; background: #484753; border-radius: 3px; font-size: 11px; }
 .connection-sorts button.active { color: #fff; background: #08b94b; }
-.connections-panel { overflow-x: hidden; }
-.connection-line { display: grid; grid-template-columns: minmax(0, 1fr) 28px; gap: 10px; align-items: center; min-height: 61px; padding: 7px 12px; color: #b9b7c0; border-bottom: 1px solid #51505c; font-size: 10px; }
+.connections-panel { min-height: 0; flex: 1; overflow: hidden auto; scrollbar-gutter: stable; }
+.connection-line { display: grid; height: 61px; grid-template-columns: minmax(0, 1fr) 28px; gap: 10px; align-items: center; padding: 7px 12px; color: #b9b7c0; border-bottom: 1px solid #51505c; font-size: 10px; }
 .connection-detail { min-width: 0; }
 .connection-line strong, .connection-line small { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .connection-line strong { color: #f1eff2; font-size: 14px; font-weight: 500; }
@@ -354,7 +354,7 @@ html.wvu-titlebar-ready .cfw-window > .titlebar { display: none; }
   .proxy-current { font-size: 15px; }
   .profile-card { min-height: 60px; padding: 9px 12px; }
   .log-line { min-height: 32px; }
-  .connection-line { min-height: 56px; }
+  .connection-line { height: 61px; }
   .simple-setting { min-height: 46px; }
   .connections-panel { overflow: hidden; }
   .connection-line { min-width: 0; }

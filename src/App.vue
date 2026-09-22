@@ -63,7 +63,6 @@ const tunEnabled = ref(false)
 const systemProxyCoreId = ref<string | null>(null)
 const systemProxyPendingCoreId = ref<string | null>(null)
 const startWithWindowsEnabled = ref(true)
-const darkThemeEnabled = ref(true)
 const rememberPageEnabled = ref(localStorage.getItem('ohmyclash.rememberPage') !== 'false')
 const trayOnCloseEnabled = ref(localStorage.getItem('ohmyclash.trayResident') === 'true')
 const proxyMode = ref<ProxyMode>('Rule')
@@ -106,10 +105,15 @@ const subscriptionName = ref('')
 const subscriptionUrl = ref('')
 const showErrorsOnly = ref(false)
 const logPanel = ref<HTMLElement | null>(null)
+const connectionsPanel = ref<HTMLElement | null>(null)
 const logStickToBottom = ref(true)
 const connectionSearch = ref('')
 const connectionsPaused = ref(false)
 const connectionSort = ref<ConnectionSort>('downloadSpeed')
+const connectionScrollTop = ref(0)
+const connectionViewportHeight = ref(720)
+const connectionRowHeight = 61
+const connectionVirtualOverscan = 8
 const uploadTotal = ref(0)
 const downloadTotal = ref(0)
 const uploadRate = ref(0)
@@ -274,9 +278,45 @@ const visibleConnections = computed(() => {
     .map(({ connection }) => connection)
 })
 
+const virtualConnectionStart = computed(() => Math.min(
+  Math.max(0, visibleConnections.value.length - Math.ceil(connectionViewportHeight.value / connectionRowHeight)),
+  Math.max(0, Math.floor(connectionScrollTop.value / connectionRowHeight) - connectionVirtualOverscan),
+))
+const virtualConnectionEnd = computed(() => Math.min(
+  visibleConnections.value.length,
+  Math.ceil((connectionScrollTop.value + connectionViewportHeight.value) / connectionRowHeight) + connectionVirtualOverscan,
+))
+const virtualConnections = computed(() => visibleConnections.value.slice(virtualConnectionStart.value, virtualConnectionEnd.value))
+const virtualConnectionTop = computed(() => virtualConnectionStart.value * connectionRowHeight)
+const virtualConnectionBottom = computed(() => Math.max(0, (visibleConnections.value.length - virtualConnectionEnd.value) * connectionRowHeight))
+
 function finiteConnectionMetric(value: number) {
   return Number.isFinite(value) ? Math.max(0, value) : 0
 }
+
+function onConnectionsScroll() {
+  const panel = connectionsPanel.value
+  if (!panel) return
+  connectionScrollTop.value = panel.scrollTop
+  connectionViewportHeight.value = panel.clientHeight
+}
+
+watch([connectionSearch, connectionSort], () => {
+  connectionScrollTop.value = 0
+  if (connectionsPanel.value) connectionsPanel.value.scrollTop = 0
+})
+
+let connectionPanelResizeObserver: ResizeObserver | undefined
+watch(connectionsPanel, (panel) => {
+  connectionPanelResizeObserver?.disconnect()
+  connectionPanelResizeObserver = undefined
+  if (!panel) return
+  connectionViewportHeight.value = panel.clientHeight
+  connectionPanelResizeObserver = new ResizeObserver(() => {
+    connectionViewportHeight.value = panel.clientHeight
+  })
+  connectionPanelResizeObserver.observe(panel)
+})
 
 const connectionSorts: Array<{ id: ConnectionSort; label: string }> = [
   { id: 'uploadSpeed', label: '上传速度' },
@@ -368,10 +408,6 @@ function toggleStartWithWindows() {
   toggleSetting('开机启动', startWithWindowsEnabled)
 }
 
-function toggleDarkTheme() {
-  toggleSetting('深色主题', darkThemeEnabled)
-}
-
 function toggleRememberPage() {
   rememberPageEnabled.value = !rememberPageEnabled.value
   localStorage.setItem('ohmyclash.rememberPage', String(rememberPageEnabled.value))
@@ -382,9 +418,25 @@ function toggleRememberPage() {
 
 async function syncTrayResident(enabled: boolean) {
   const api = (window as Window & { pywebview?: { api?: { set_tray_resident?: (value: boolean) => Promise<{ success: boolean }> } } }).pywebview?.api
-  if (!api?.set_tray_resident) return
+  if (!api?.set_tray_resident) return false
   const result = await api.set_tray_resident(enabled)
   if (!result.success) throw new Error('无法更新托盘常驻状态')
+  return true
+}
+
+let trayInitializationInFlight = false
+async function initializeTrayResident() {
+  if (!trayOnCloseEnabled.value || trayInitializationInFlight) return
+  const api = (window as Window & { pywebview?: { api?: { set_tray_resident?: (value: boolean) => Promise<{ success: boolean }> } } }).pywebview?.api
+  if (!api?.set_tray_resident) return
+  trayInitializationInFlight = true
+  try {
+    await syncTrayResident(true)
+  } catch (error) {
+    showToast(readableError(error, '无法初始化托盘'))
+  } finally {
+    trayInitializationInFlight = false
+  }
 }
 
 async function toggleTrayOnClose() {
@@ -1173,11 +1225,13 @@ async function closeAllConnections() {
 let liveDataTimer: number | undefined
 let uptimeTimer: number | undefined
 let statusTimer: number | undefined
+const handlePywebviewReady = () => { void initializeTrayResident() }
 onMounted(() => {
   void loadCores()
   void pollManagedInstances()
   if (activePage.value !== 'general') selectPage(activePage.value)
-  void syncTrayResident(trayOnCloseEnabled.value).catch((error) => showToast(readableError(error, '无法初始化托盘')))
+  window.addEventListener('pywebviewready', handlePywebviewReady)
+  void initializeTrayResident()
   window.addEventListener('pointerdown', closeContextMenu)
   document.addEventListener('visibilitychange', refreshVisiblePage)
   liveDataTimer = window.setInterval(() => {
@@ -1192,7 +1246,10 @@ onBeforeUnmount(() => {
   if (liveDataTimer) window.clearInterval(liveDataTimer)
   if (uptimeTimer) window.clearInterval(uptimeTimer)
   if (statusTimer) window.clearInterval(statusTimer)
+  window.removeEventListener('pywebviewready', handlePywebviewReady)
   window.removeEventListener('pointerdown', closeContextMenu)
+  document.removeEventListener('visibilitychange', refreshVisiblePage)
+  connectionPanelResizeObserver?.disconnect()
 })
 
 function refreshVisiblePage() {
@@ -1396,16 +1453,17 @@ function windowAction(label: string) {
         <section v-else-if="activePage === 'connections'" class="screen-page connections-page">
           <div class="connections-heading"><h2>连接 <span class="heading-count">{{ connections.length }}</span></h2><input v-model="connectionSearch" class="search-box" placeholder="搜索" /><button class="page-button pause-button" :class="{ active: connectionsPaused }" @click="toggleConnectionsPaused">{{ connectionsPaused ? '继续' : '暂停' }}</button><div class="connection-totals">总计: <span>↑{{ formatTraffic(uploadTotal) }}</span> <span>↓{{ formatTraffic(downloadTotal) }}</span></div></div>
           <div class="connection-toolbar"><div class="connection-sorts"><button v-for="sort in connectionSorts" :key="sort.id" :class="{ active: connectionSort === sort.id }" @click="connectionSort = sort.id">{{ sort.label }}</button></div><button class="page-button close-all-button" :disabled="connections.length === 0" @click="closeAllConnections">关闭全部</button></div>
-          <div class="connections-panel">
+          <div ref="connectionsPanel" class="connections-panel" @scroll.passive="onConnectionsScroll">
             <div v-if="visibleConnections.length === 0" class="panel-empty">暂无匹配连接</div>
-            <div v-for="connection in visibleConnections" :key="connection.id" class="connection-line"><div class="connection-detail"><strong>{{ connection.host }}</strong><div class="connection-tags"><span class="tag-network">{{ connection.network }}</span><span class="tag-inbound">{{ connection.inbound }}</span><span class="tag-process">{{ connection.process }}</span><span class="tag-policy">{{ connection.policy }}</span><span class="tag-age">{{ connectionAge(connection.startedAt) }}</span><span v-if="connection.uploadSpeed || connection.downloadSpeed" class="tag-speed">↑{{ formatRate(connection.uploadSpeed) }} ↓{{ formatRate(connection.downloadSpeed) }}</span></div></div><button title="关闭连接" aria-label="关闭连接" @click="closeConnection(connection.id)"><svg class="row-icon close-icon"><use href="#icon-connection-close" /></svg></button></div>
+            <div v-if="virtualConnectionTop" aria-hidden="true" :style="{ height: `${virtualConnectionTop}px` }" />
+            <div v-for="connection in virtualConnections" :key="connection.id" class="connection-line"><div class="connection-detail"><strong>{{ connection.host }}</strong><div class="connection-tags"><span class="tag-network">{{ connection.network }}</span><span class="tag-inbound">{{ connection.inbound }}</span><span class="tag-process">{{ connection.process }}</span><span class="tag-policy">{{ connection.policy }}</span><span class="tag-age">{{ connectionAge(connection.startedAt) }}</span><span v-if="connection.uploadSpeed || connection.downloadSpeed" class="tag-speed">↑{{ formatRate(connection.uploadSpeed) }} ↓{{ formatRate(connection.downloadSpeed) }}</span></div></div><button title="关闭连接" aria-label="关闭连接" @click="closeConnection(connection.id)"><svg class="row-icon close-icon"><use href="#icon-connection-close" /></svg></button></div>
+            <div v-if="virtualConnectionBottom" aria-hidden="true" :style="{ height: `${virtualConnectionBottom}px` }" />
           </div>
         </section>
 
         <section v-else-if="activePage === 'settings'" class="screen-page narrow-page">
           <div class="screen-heading"><div><h2>设置</h2><p>应用外观和运行偏好</p></div></div>
           <div class="simple-settings">
-            <button class="simple-setting setting-control" @click="toggleDarkTheme"><div><strong>深色主题</strong><small>使用 CFW 风格的深色外观</small></div><span class="switch" :class="{ on: darkThemeEnabled }"><i /></span></button>
             <button class="simple-setting setting-control" @click="toggleRememberPage"><div><strong>启动时打开上次页面</strong><small>记住上次使用的导航位置</small></div><span class="switch" :class="{ on: rememberPageEnabled }"><i /></span></button>
             <button class="simple-setting setting-control" @click="toggleTrayOnClose"><div><strong>状态栏常驻</strong><small>关闭窗口后隐藏到系统托盘，核心继续运行</small></div><span class="switch" :class="{ on: trayOnCloseEnabled }"><i /></span></button>
           </div>
