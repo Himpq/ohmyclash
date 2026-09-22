@@ -116,27 +116,58 @@ class MihomoManager:
 
     def wait_for_ready(self, timeout: float = 60.0) -> None:
         for instance_id in self.instance_ids:
-            spec = self._get_spec(instance_id)
-            logger.info("waiting for Mihomo controller id=%s timeout=%ss", instance_id, timeout)
-            deadline = time.monotonic() + timeout
-            last_error = "controller is not ready"
-            while time.monotonic() < deadline:
+            self.wait_for_instance(instance_id, timeout)
+
+    def wait_for_instance(self, instance_id: str, timeout: float = 60.0) -> None:
+        spec = self._get_spec(instance_id)
+        logger.info("waiting for Mihomo controller id=%s timeout=%ss", instance_id, timeout)
+        deadline = time.monotonic() + timeout
+        last_error = "controller is not ready"
+        while time.monotonic() < deadline:
+            with self._lock:
+                managed = self._processes.get(instance_id)
+                if managed is None or managed.process.poll() is not None:
+                    detail = managed.logs[-1] if managed and managed.logs else "no core output"
+                    raise ManagerError(f"Mihomo process exited before becoming ready: {spec.name}; last output: {detail}")
+            try:
+                self.request(instance_id, "GET", "/version")
+                return
+            except ControllerError as exc:
+                if exc.status in {401, 403}:
+                    raise ManagerError(f"controller authentication failed: {spec.name}") from exc
+                last_error = f"controller returned HTTP {exc.status}"
+            except ManagerError as exc:
+                last_error = str(exc)
+            time.sleep(0.15)
+        raise ManagerError(f"timed out waiting for Mihomo controller ({spec.name}): {last_error}")
+
+    def add_instance(self, spec: InstanceSpec, timeout: float = 60.0) -> dict[str, Any]:
+        with self._lock:
+            if self._closed:
+                raise ManagerError("Mihomo manager is closed")
+            if spec.id in self._specs:
+                raise ManagerError(f"instance already exists: {spec.id}")
+            self._validate_specs([*self._specs.values(), spec])
+            self._specs[spec.id] = spec
+        try:
+            self.start(spec.id)
+            self.wait_for_instance(spec.id, timeout)
+            return self.status(spec.id)
+        except Exception as exc:
+            with self._lock:
+                managed = self._processes.get(spec.id)
+                output = list(managed.logs)[-8:] if managed else []
+            if output:
+                logger.error("new core startup output id=%s lines=%s", spec.id, output)
+            try:
+                self.stop(spec.id)
+            finally:
                 with self._lock:
-                    managed = self._processes.get(instance_id)
-                    if managed is None or managed.process.poll() is not None:
-                        raise ManagerError(f"Mihomo process exited before becoming ready: {spec.name}")
-                try:
-                    self.request(instance_id, "GET", "/version")
-                    break
-                except ControllerError as exc:
-                    if exc.status in {401, 403}:
-                        raise ManagerError(f"controller authentication failed: {spec.name}") from exc
-                    last_error = f"controller returned HTTP {exc.status}"
-                except ManagerError as exc:
-                    last_error = str(exc)
-                time.sleep(0.15)
-            else:
-                raise ManagerError(f"timed out waiting for Mihomo controller ({spec.name}): {last_error}")
+                    self._processes.pop(spec.id, None)
+                    self._specs.pop(spec.id, None)
+            if output:
+                raise ManagerError(f"{exc}; last output: {output[-1]}") from exc
+            raise
 
     def start(self, instance_id: str) -> dict[str, Any]:
         spec = self._get_spec(instance_id)
@@ -305,7 +336,6 @@ class MihomoManager:
             timestamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
             message = line.rstrip()
             managed.logs.append(f"{timestamp} {message}")
-            get_logger(f"core.{managed.spec.id}").info("%s", message)
 
 
 def load_manager_config(path: Path) -> tuple[MihomoManager, dict[str, Any]]:

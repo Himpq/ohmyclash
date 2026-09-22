@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import ipaddress
 import json
 import os
 import re
 import secrets
 import shutil
 import socket
+import subprocess
 import hashlib
 import ctypes
 from datetime import datetime, timezone
@@ -18,6 +20,9 @@ from urllib.request import Request, urlopen
 import yaml
 
 from .mihomo_manager import InstanceSpec, ManagerError, MihomoManager
+
+
+BUNDLED_GEOIP_METADB_SHA256 = "6eef2fedc2dae7091c112be13895968135ec01e702df2f5b4b1161b07d714720"
 
 
 @dataclass(frozen=True)
@@ -37,6 +42,7 @@ class ManagedCore:
     controller_port: int
     mixed_port: int
     secret: str
+    mode: str = "rule"
     tun_enabled: bool = False
     allow_lan: bool = False
     ipv6: bool = False
@@ -97,6 +103,12 @@ class ManagedRuntime:
         specs = [self._prepare_instance(core, profiles[core.profile_id], core_path) for core in cores if core.profile_id in profiles]
         return MihomoManager(specs)
 
+    def build_instance(self, core_id: str) -> InstanceSpec:
+        core = self.get_core(core_id)
+        profile = self._find_profile(core.profile_id)
+        core_path = CoreLocator(self.project_root).locate()
+        return self._prepare_instance(core, profile, core_path)
+
     def list_cores(self, migrate: bool = False) -> list[ManagedCore]:
         if not self.cores_path.is_file():
             if migrate:
@@ -111,7 +123,18 @@ class ManagedRuntime:
             raise ManagerError(f"cannot read core catalog: {exc}") from exc
         if not isinstance(raw, list):
             raise ManagerError("core catalog must be an array")
-        return [self._core_from_dict(item) for item in raw if isinstance(item, dict)]
+        cores: list[ManagedCore] = []
+        catalog_changed = False
+        for item in raw:
+            if not isinstance(item, dict):
+                continue
+            if "mode" not in item:
+                item = {**item, "mode": self._profile_mode(str(item.get("profileId", "")))}
+                catalog_changed = True
+            cores.append(self._core_from_dict(item))
+        if catalog_changed:
+            self._save_cores(cores)
+        return cores
 
     def core_infos(self) -> list[dict[str, Any]]:
         return [self._core_info(core) for core in self.list_cores(migrate=True)]
@@ -141,7 +164,10 @@ class ManagedRuntime:
         controller_port = self._free_port(reserved)
         reserved.add(controller_port)
         mixed_port = self._free_port(reserved)
-        core = ManagedCore(core_id, clean_name, profile_id, controller_port, mixed_port, secrets.token_urlsafe(32))
+        core = ManagedCore(
+            core_id, clean_name, profile_id, controller_port, mixed_port,
+            secrets.token_urlsafe(32), self._profile_mode(profile_id),
+        )
         self._save_cores([*cores, core])
         return self._core_info(core)
 
@@ -162,6 +188,7 @@ class ManagedRuntime:
             controller_port=int(changes.get("controllerPort", current.controller_port)),
             mixed_port=int(changes.get("mixedPort", current.mixed_port)),
             secret=current.secret,
+            mode=self.normalize_core_mode(changes.get("mode", current.mode)),
             tun_enabled=bool(changes.get("tunEnabled", current.tun_enabled)),
             allow_lan=bool(changes.get("allowLan", current.allow_lan)),
             ipv6=bool(changes.get("ipv6", current.ipv6)),
@@ -190,6 +217,7 @@ class ManagedRuntime:
                     controller_port=core.controller_port,
                     mixed_port=core.mixed_port,
                     secret=core.secret,
+                    mode=core.mode,
                     tun_enabled=False,
                     allow_lan=core.allow_lan,
                     ipv6=core.ipv6,
@@ -199,6 +227,32 @@ class ManagedRuntime:
             ]
         self._save_cores(next_cores)
         return self._core_info(updated)
+
+    def update_core_mode(self, core_id: str, mode: object) -> dict[str, Any]:
+        cores = self.list_cores()
+        current = next((core for core in cores if core.id == core_id), None)
+        if current is None:
+            raise ManagerError(f"core not found: {core_id}")
+        normalized = self.normalize_core_mode(mode)
+        updated = ManagedCore(
+            id=current.id,
+            name=current.name,
+            profile_id=current.profile_id,
+            controller_port=current.controller_port,
+            mixed_port=current.mixed_port,
+            secret=current.secret,
+            mode=normalized,
+            tun_enabled=current.tun_enabled,
+            allow_lan=current.allow_lan,
+            ipv6=current.ipv6,
+            log_level=current.log_level,
+        )
+        self._save_cores([updated if core.id == core_id else core for core in cores])
+        return self._core_info(updated)
+
+    def restore_cores(self, cores: list[ManagedCore]) -> None:
+        """Restore a catalog snapshot after a runtime reload cannot start."""
+        self._save_cores(cores)
 
     def delete_core(self, core_id: str) -> dict[str, Any]:
         cores = self.list_cores()
@@ -414,6 +468,7 @@ class ManagedRuntime:
         return ManagedCore(
             id=str(raw["id"]), name=str(raw["name"]), profile_id=str(raw["profileId"]),
             controller_port=int(raw["controllerPort"]), mixed_port=int(raw["mixedPort"]), secret=str(raw["secret"]),
+            mode=ManagedRuntime.normalize_core_mode(raw.get("mode", "rule")),
             tun_enabled=bool(raw.get("tunEnabled", False)), allow_lan=bool(raw.get("allowLan", False)),
             ipv6=bool(raw.get("ipv6", False)), log_level=str(raw.get("logLevel", "info")),
         )
@@ -423,6 +478,7 @@ class ManagedRuntime:
         return {
             "id": core.id, "name": core.name, "profileId": core.profile_id,
             "controllerPort": core.controller_port, "mixedPort": core.mixed_port,
+            "mode": core.mode.title(),
             "tunEnabled": core.tun_enabled, "allowLan": core.allow_lan,
             "ipv6": core.ipv6, "logLevel": core.log_level,
         }
@@ -440,6 +496,23 @@ class ManagedRuntime:
             index += 1
         return f"{base}-{index}"
 
+    @staticmethod
+    def normalize_core_mode(mode: object) -> str:
+        normalized = str(mode).strip().lower()
+        if normalized not in {"rule", "global", "direct", "script"}:
+            raise ManagerError(f"unsupported core mode: {mode}")
+        return normalized
+
+    def _profile_mode(self, profile_id: str) -> str:
+        profile = self._find_profile(profile_id)
+        try:
+            source = yaml.safe_load(profile.source_path.read_text(encoding="utf-8"))
+        except (OSError, yaml.YAMLError) as exc:
+            raise ManagerError(f"cannot read profile mode: {exc}") from exc
+        if not isinstance(source, dict):
+            raise ManagerError(f"profile must contain a YAML object: {profile.source_path}")
+        return self.normalize_core_mode(source.get("mode", "rule"))
+
     def _prepare_instance(self, core: ManagedCore, profile: ManagedProfile, core_path: Path) -> InstanceSpec:
         source = yaml.safe_load(profile.source_path.read_text(encoding="utf-8"))
         if not isinstance(source, dict):
@@ -447,6 +520,7 @@ class ManagedRuntime:
 
         runtime_dir = self.instance_dir / core.id
         runtime_dir.mkdir(parents=True, exist_ok=True)
+        self._seed_geodata(runtime_dir)
         metadata_path = runtime_dir / "runtime.json"
         secret = core.secret
         controller_port = core.controller_port
@@ -464,12 +538,38 @@ class ManagedRuntime:
         generated["allow-lan"] = core.allow_lan
         generated["ipv6"] = core.ipv6
         generated["log-level"] = core.log_level
+        generated["mode"] = core.mode
+        sniffer = dict(generated.get("sniffer") or {})
+        sniffer["enable"] = True
+        sniffer.setdefault("force-dns-mapping", True)
+        sniffer.setdefault("parse-pure-ip", True)
+        sniffer.setdefault("override-destination", False)
+        sniffer.setdefault("sniff", {
+            "HTTP": {"ports": [80, "8080-8880"]},
+            "TLS": {"ports": [443, 8443]},
+            "QUIC": {"ports": [443, 8443]},
+        })
+        generated["sniffer"] = sniffer
         tun = dict(generated.get("tun") or {})
         tun["enable"] = core.tun_enabled
         if core.tun_enabled:
             tun.setdefault("stack", "mixed")
             tun.setdefault("auto-route", True)
             tun.setdefault("auto-detect-interface", True)
+            if os.name == "nt" and not generated.get("interface-name"):
+                generated["interface-name"] = self._windows_physical_default_interface()
+            configured_exclusions = tun.get("route-exclude-address") or []
+            if not isinstance(configured_exclusions, list):
+                raise ManagerError("tun.route-exclude-address must be an array")
+            tun["route-exclude-address"] = list(dict.fromkeys([
+                *(str(item) for item in configured_exclusions),
+                *self._proxy_endpoint_exclusions(generated),
+            ]))
+            bypass_rules = self._local_proxy_process_rules(generated)
+            configured_rules = generated.get("rules") or []
+            if not isinstance(configured_rules, list):
+                raise ManagerError("rules must be an array")
+            generated["rules"] = list(dict.fromkeys([*bypass_rules, *(str(item) for item in configured_rules)]))
         generated["tun"] = tun
 
         config_path = runtime_dir / "config.yaml"
@@ -497,6 +597,123 @@ class ManagedRuntime:
             controller_url=f"http://127.0.0.1:{controller_port}",
             secret=secret,
         )
+
+    @staticmethod
+    def _proxy_endpoint_exclusions(config: dict[str, Any]) -> list[str]:
+        """Keep literal proxy endpoints outside TUN routes to prevent traffic loops."""
+        proxies = config.get("proxies") or []
+        if not isinstance(proxies, list):
+            return []
+        exclusions: list[str] = []
+        for proxy in proxies:
+            if not isinstance(proxy, dict):
+                continue
+            server = proxy.get("server")
+            if not isinstance(server, str):
+                continue
+            try:
+                address = ipaddress.ip_address(server.strip())
+            except ValueError:
+                continue
+            exclusions.append(f"{address}/{address.max_prefixlen}")
+        return list(dict.fromkeys(exclusions))
+
+    def _seed_geodata(self, runtime_dir: Path) -> None:
+        source = self.project_root / "runtime" / "geodata" / "geoip.metadb"
+        if not source.is_file():
+            raise ManagerError(f"内置 GeoIP 数据库缺失: {source}")
+        if self._file_sha256(source) != BUNDLED_GEOIP_METADB_SHA256:
+            raise ManagerError(f"内置 GeoIP 数据库校验失败: {source}")
+
+        target = runtime_dir / "geoip.metadb"
+        if target.is_file() and self._file_sha256(target) == BUNDLED_GEOIP_METADB_SHA256:
+            return
+
+        temporary = runtime_dir / "geoip.metadb.tmp"
+        shutil.copy2(source, temporary)
+        temporary.replace(target)
+
+    @staticmethod
+    def _file_sha256(path: Path) -> str:
+        digest = hashlib.sha256()
+        with path.open("rb") as stream:
+            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
+
+    @staticmethod
+    def _windows_physical_default_interface() -> str:
+        command = (
+            "[Console]::OutputEncoding=[Text.UTF8Encoding]::new($false); "
+            "$routes=Get-NetRoute -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0' -ErrorAction Stop | "
+            "Where-Object {$_.NextHop -ne '198.18.0.2' -and $_.InterfaceAlias -ne 'Meta'}; "
+            "$route=$routes | Sort-Object RouteMetric | Select-Object -First 1; "
+            "if ($null -eq $route) { throw 'physical default interface not found' }; "
+            "$route.InterfaceAlias"
+        )
+        creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        result = subprocess.run(
+            ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", command],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=10,
+            creationflags=creationflags,
+            check=False,
+        )
+        interface_name = result.stdout.strip()
+        if result.returncode != 0 or not interface_name:
+            detail = result.stderr.strip() or "physical default interface not found"
+            raise ManagerError(f"无法确定 TUN 出站网卡: {detail}")
+        return interface_name
+
+    @staticmethod
+    def _local_proxy_process_rules(config: dict[str, Any]) -> list[str]:
+        if os.name != "nt":
+            return []
+        proxies = config.get("proxies") or []
+        if not isinstance(proxies, list):
+            return []
+        local_ports: set[int] = set()
+        for proxy in proxies:
+            if not isinstance(proxy, dict):
+                continue
+            server = str(proxy.get("server", "")).strip().lower()
+            if server not in {"127.0.0.1", "::1", "localhost"}:
+                continue
+            try:
+                port = int(proxy.get("port"))
+            except (TypeError, ValueError):
+                raise ManagerError(f"本地代理 {proxy.get('name', '<unnamed>')} 缺少有效端口")
+            if not 1 <= port <= 65535:
+                raise ManagerError(f"本地代理 {proxy.get('name', '<unnamed>')} 端口无效: {port}")
+            local_ports.add(port)
+
+        rules: list[str] = []
+        creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        for port in sorted(local_ports):
+            command = (
+                f"$connection=Get-NetTCPConnection -State Listen -LocalPort {port} -ErrorAction SilentlyContinue | "
+                "Select-Object -First 1; "
+                "if ($null -ne $connection) {(Get-Process -Id $connection.OwningProcess -ErrorAction Stop).ProcessName}"
+            )
+            result = subprocess.run(
+                ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", command],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=5,
+                creationflags=creationflags,
+                check=False,
+            )
+            process_name = result.stdout.strip()
+            if result.returncode != 0 or not process_name:
+                raise ManagerError(f"本地上游代理 127.0.0.1:{port} 没有正在监听的进程，无法安全开启 TUN")
+            executable = process_name if process_name.lower().endswith(".exe") else f"{process_name}.exe"
+            rules.append(f"PROCESS-NAME,{executable},DIRECT")
+        return list(dict.fromkeys(rules))
 
     @staticmethod
     def _load_metadata(path: Path) -> dict[str, Any]:

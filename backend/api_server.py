@@ -77,19 +77,16 @@ class BackendHandler(BaseHTTPRequestHandler):
                     payload = self._read_json_object()
                     core = self.server.runtime.create_core(self._required_string(payload, "name"), self._required_string(payload, "profileId"))
                     try:
-                        instances = self.server.reload_runtime()
+                        spec = self.server.runtime.build_instance(core["id"])
+                        self.server.manager.add_instance(spec)
                     except Exception:
                         logger.exception("new core startup failed; rolling back core=%s", core["id"])
                         try:
                             self.server.runtime.delete_core(core["id"])
                         except Exception:
                             logger.exception("failed to roll back core=%s", core["id"])
-                        try:
-                            self.server.reload_runtime()
-                        except Exception:
-                            logger.exception("failed to restore runtime after rolling back core=%s", core["id"])
                         raise
-                    self._json(200, {"core": core, "instances": instances})
+                    self._json(200, {"core": core, "instances": self.server.manager.statuses()})
                 return
             if path == "/api/profiles/import" and method == "POST":
                 with self.server.lifecycle_lock:
@@ -137,12 +134,33 @@ class BackendHandler(BaseHTTPRequestHandler):
 
             if len(parts) == 4 and parts[1:3] == ["api", "cores"] and method == "PUT":
                 with self.server.lifecycle_lock:
+                    core_id = unquote(parts[3])
+                    previous_cores = self.server.runtime.list_cores()
                     proxy_status = system_proxy_status()
                     proxy_core_id = self.server.runtime.core_id_for_proxy_server(proxy_status["server"]) if proxy_status["enabled"] else None
-                    core = self.server.runtime.update_core(unquote(parts[3]), self._read_json_object())
-                    instances = self.server.reload_runtime()
-                    if proxy_status["enabled"] and proxy_core_id == core["id"]:
-                        set_system_proxy(True, int(core["mixedPort"]))
+                    catalog_updated = False
+                    try:
+                        core = self.server.runtime.update_core(core_id, self._read_json_object())
+                        catalog_updated = True
+                        instances = self.server.reload_runtime()
+                        if proxy_status["enabled"] and proxy_core_id == core["id"]:
+                            set_system_proxy(True, int(core["mixedPort"]))
+                    except Exception:
+                        if catalog_updated:
+                            logger.exception("core update failed; rolling back core=%s", core_id)
+                            try:
+                                self.server.runtime.restore_cores(previous_cores)
+                            except Exception:
+                                logger.exception("failed to restore core catalog after update failure core=%s", core_id)
+                            try:
+                                self.server.reload_runtime()
+                                if proxy_status["enabled"] and proxy_core_id:
+                                    previous_proxy_core = next((item for item in previous_cores if item.id == proxy_core_id), None)
+                                    if previous_proxy_core:
+                                        set_system_proxy(True, previous_proxy_core.mixed_port)
+                            except Exception:
+                                logger.exception("failed to restore runtime after core update failure core=%s", core_id)
+                        raise
                     self._json(200, {"core": core, "instances": instances})
                 return
             if len(parts) == 4 and parts[1:3] == ["api", "cores"] and method == "DELETE":
@@ -155,6 +173,26 @@ class BackendHandler(BaseHTTPRequestHandler):
                     self.server.manager.stop(core_id)
                     core = self.server.runtime.delete_core(core_id)
                     self._json(200, {"core": core, "instances": self.server.reload_runtime()})
+                return
+            if len(parts) == 5 and parts[1:3] == ["api", "cores"] and parts[4] == "mode" and method == "PUT":
+                with self.server.lifecycle_lock:
+                    core_id = unquote(parts[3])
+                    payload = self._read_json_object()
+                    previous = self.server.runtime.get_core(core_id)
+                    requested_mode = self.server.runtime.normalize_core_mode(payload.get("mode"))
+                    running = self.server.manager.status(core_id)["running"]
+                    if running:
+                        self.server.manager.request(core_id, "PATCH", "/configs", payload={"mode": requested_mode})
+                    try:
+                        core = self.server.runtime.update_core_mode(core_id, requested_mode)
+                    except Exception:
+                        if running:
+                            try:
+                                self.server.manager.request(core_id, "PATCH", "/configs", payload={"mode": previous.mode})
+                            except Exception:
+                                logger.exception("failed to restore runtime mode core=%s mode=%s", core_id, previous.mode)
+                        raise
+                    self._json(200, {"core": core})
                 return
 
             if len(parts) < 4 or parts[1:3] != ["api", "instances"]:
