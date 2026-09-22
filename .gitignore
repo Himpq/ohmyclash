@@ -4,6 +4,9 @@ dist/
 output/
 .playwright-cli/
 
+# Mihomo binary is kept locally or distributed separately
+runtime/core/*.exe
+
 # Python bytecode and local environments
 **/__pycache__/
 *.py[cod]
