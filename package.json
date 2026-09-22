@@ -1,0 +1,23 @@
+{
+  "name": "ohmyclash",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vue-tsc --noEmit && vite build",
+    "preview": "vite preview",
+    "desktop": "python -m desktop.launcher",
+    "desktop:dist": "npm run build && python -m desktop.launcher --dist"
+  },
+  "dependencies": {
+    "vue": "^3.5.18"
+  },
+  "devDependencies": {
+    "@types/node": "^24.3.0",
+    "@vitejs/plugin-vue": "^6.0.1",
+    "typescript": "^5.8.3",
+    "vite": "^7.1.4",
+    "vue-tsc": "^2.2.12"
+  }
+}

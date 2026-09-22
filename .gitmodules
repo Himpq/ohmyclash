@@ -1,0 +1,3 @@
+[submodule "WebViewUI"]
+	path = WebViewUI
+	url = https://github.com/Himpq/WebViewUI.git

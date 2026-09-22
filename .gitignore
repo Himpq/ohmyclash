@@ -1,0 +1,26 @@
+# Local dependencies and build output
+node_modules/
+dist/
+output/
+.playwright-cli/
+
+# Python bytecode and local environments
+**/__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+
+# Local OhMyClash state: profiles, controller secrets, logs and runtime caches
+data/*
+!data/profiles/
+!data/profiles/.gitkeep
+data/profiles/*
+!data/profiles/.gitkeep
+
+# Local environment and editor files
+.env
+.env.*
+.idea/
+.vscode/
+*.code-workspace
