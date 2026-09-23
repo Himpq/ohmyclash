@@ -261,7 +261,7 @@ html.wvu-titlebar-ready .cfw-window > .titlebar { display: none; }
 .simple-setting strong { color: #ebe9ed; font-size: 13px; font-weight: 400; }
 .simple-setting small { margin-top: 4px; color: #9694a0; font-size: 10px; }
 .core-list { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
-.core-card { padding: 12px 14px; background: #333242; border: 1px solid #42414f; }
+.core-card { padding: 12px 14px; background: #333242; border: 1px solid #42414f; cursor: pointer; }
 .core-card.active { border-color: #6283bd; box-shadow: inset 3px 0 #6283bd; }
 .core-card-heading { display: flex; align-items: center; justify-content: space-between; padding-bottom: 8px; border-bottom: 1px solid #43424f; }
 .core-card-heading button { min-width: 0; color: #efedf1; background: transparent; text-align: left; }

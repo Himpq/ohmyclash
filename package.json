@@ -1,14 +1,15 @@
 {
   "name": "ohmyclash",
   "private": true,
-  "version": "0.1.0",
+  "version": "0.1.7",
   "type": "module",
   "scripts": {
     "dev": "vite",
     "build": "vue-tsc --noEmit && vite build",
     "preview": "vite preview",
     "desktop": "python -m desktop.launcher",
-    "desktop:dist": "npm run build && python -m desktop.launcher --dist"
+    "desktop:dist": "npm run build && python -m desktop.launcher --dist",
+    "desktop:package": "python scripts/package_windows.py"
   },
   "dependencies": {
     "vue": "^3.5.18"

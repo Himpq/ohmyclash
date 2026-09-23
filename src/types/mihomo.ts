@@ -52,6 +52,7 @@ export type SystemProxyStatus = { enabled: boolean; server: string; coreId: stri
 export type ProfileMutationResponse = {
   profile: ProfileSummary
   instances: ManagedInstanceStatus[]
+  core?: CoreSummary
 }
 
 export type MihomoProxy = {

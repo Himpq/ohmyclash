@@ -1,10 +1,12 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import AboutPage from './components/AboutPage.vue'
 import YamlEditor from './components/YamlEditor.vue'
 import { addSubscription, createCore, deleteCore, deleteProfile, getProfileContent, getSystemProxy, importProfile, listCores, listManagedInstances, listProfiles, MihomoClient, refreshProfile, revealProfile, saveProfile, setSystemProxy, updateCore, updateCoreMode } from './services/mihomo'
-import type { CoreSummary, ManagedInstanceStatus, MihomoConnection, MihomoInstanceConfig, MihomoInstanceId, MihomoProxy, MihomoRule, ProfileSummary, ProxyMode } from './types/mihomo'
+import type { CoreSummary, ManagedInstanceStatus, MihomoConnection, MihomoInstanceConfig, MihomoInstanceId, MihomoProxy, MihomoRule, ProfileMutationResponse, ProfileSummary, ProxyMode } from './types/mihomo'
+import { APP_VERSION } from './version'
 
-type PageId = 'general' | 'proxies' | 'profiles' | 'cores' | 'logs' | 'connections' | 'settings' | 'feedback'
+type PageId = 'general' | 'proxies' | 'profiles' | 'cores' | 'logs' | 'connections' | 'settings' | 'about'
 type LogLevel = 'INFO' | 'WARN' | 'ERROR'
 type ProxySortMode = 'natural' | 'delay'
 
@@ -54,8 +56,9 @@ type Connection = {
 type ConnectionSort = 'uploadSpeed' | 'downloadSpeed' | 'upload' | 'download' | 'time'
 type DeleteTarget = { kind: 'profile' | 'core'; id: string; name: string }
 
-const pageIds: PageId[] = ['general', 'proxies', 'profiles', 'cores', 'logs', 'connections', 'settings', 'feedback']
-const storedPage = localStorage.getItem('ohmyclash.activePage') as PageId | null
+const pageIds: PageId[] = ['general', 'proxies', 'profiles', 'cores', 'logs', 'connections', 'settings', 'about']
+const storedPageValue = localStorage.getItem('ohmyclash.activePage')
+const storedPage = (storedPageValue === 'feedback' ? 'about' : storedPageValue) as PageId | null
 const activePage = ref<PageId>(storedPage && pageIds.includes(storedPage) ? storedPage : 'general')
 const allowLanEnabled = ref(true)
 const ipv6Enabled = ref(false)
@@ -87,6 +90,7 @@ const showInstanceMenu = ref(false)
 const updatingProfile = ref('')
 const switchingProfileId = ref('')
 const coreMutationPending = ref(false)
+const pendingCoreMutationIds = ref<Record<string, true>>({})
 const profiles = ref<ProfileSummary[]>([])
 const cores = ref<CoreSummary[]>([])
 const coreDrafts = ref<Record<string, CoreDraft>>({})
@@ -334,7 +338,7 @@ const navItems: Array<{ id: PageId; label: string; icon: string }> = [
   { id: 'logs', label: '日志', icon: 'nav-logs' },
   { id: 'connections', label: '连接', icon: 'nav-connections' },
   { id: 'settings', label: '设置', icon: 'nav-settings' },
-  { id: 'feedback', label: '反馈', icon: 'nav-feedback' },
+  { id: 'about', label: '关于', icon: 'nav-about' },
 ]
 
 const pageTitle = computed(() => navItems.find((item) => item.id === activePage.value)?.label ?? '常规')
@@ -539,6 +543,26 @@ function applyManagedInstances(instances: ManagedInstanceStatus[]) {
   }
 }
 
+async function applyImportedProfileResult(response: ProfileMutationResponse) {
+  profiles.value = [...profiles.value.filter((profile) => profile.id !== response.profile.id), response.profile]
+  selectedProfile.value = response.profile.id
+  if (!response.core) return
+
+  cores.value = [...cores.value.filter((core) => core.id !== response.core?.id), response.core]
+  coreDrafts.value = {
+    ...coreDrafts.value,
+    [response.core.id]: {
+      name: response.core.name,
+      controllerPort: String(response.core.controllerPort),
+      mixedPort: String(response.core.mixedPort),
+    },
+  }
+  proxyMode.value = response.core.mode
+  applyManagedInstances(response.instances)
+  activeInstanceId.value = response.core.id
+  await loadProxyData()
+}
+
 async function pollManagedInstances() {
   if (statusLoading) return
   statusLoading = true
@@ -571,17 +595,52 @@ async function submitCore() {
 }
 
 async function patchCore(core: CoreSummary, changes: Record<string, unknown>) {
-  if (coreMutationPending.value) return
-  coreMutationPending.value = true
+  if (!beginCoreMutation(core.id)) return
   try {
+    if (changes.tunEnabled === true) {
+      const api = (window as Window & {
+        pywebview?: {
+          api?: {
+            prepare_tun_enable?: (coreId: string) => Promise<{
+              success: boolean
+              alreadyAdmin?: boolean
+              restarting?: boolean
+              message?: string
+            }>
+          }
+        }
+      }).pywebview?.api
+      if (api?.prepare_tun_enable) {
+        showToast('正在申请管理员权限，请在系统提示中批准')
+        const result = await api.prepare_tun_enable(core.id)
+        if (!result.success) throw new Error(result.message || '未能申请 TUN 管理员权限')
+        if (result.restarting) return
+      }
+    }
     await updateCore(core.id, changes)
     await loadCores()
     await loadProxyData()
   } catch (error) {
     showToast(readableError(error, '核心设置保存失败'))
   } finally {
-    coreMutationPending.value = false
+    finishCoreMutation(core.id)
   }
+}
+
+function isCoreMutationPending(coreId: string) {
+  return Boolean(pendingCoreMutationIds.value[coreId])
+}
+
+function beginCoreMutation(coreId: string) {
+  if (coreMutationPending.value || isCoreMutationPending(coreId)) return false
+  pendingCoreMutationIds.value = { ...pendingCoreMutationIds.value, [coreId]: true }
+  return true
+}
+
+function finishCoreMutation(coreId: string) {
+  const pending = { ...pendingCoreMutationIds.value }
+  delete pending[coreId]
+  pendingCoreMutationIds.value = pending
 }
 
 function coreDraft(core: CoreSummary): CoreDraft {
@@ -628,7 +687,7 @@ function parseCorePort(value: string, label: string): number {
 }
 
 async function saveCoreDraft(core: CoreSummary) {
-  if (coreMutationPending.value || !coreDraftDirty(core)) return
+  if (!coreDraftDirty(core) || !beginCoreMutation(core.id)) return
   const draft = coreDraft(core)
   const name = draft.name.trim()
   let controllerPort: number
@@ -645,10 +704,10 @@ async function saveCoreDraft(core: CoreSummary) {
     if (usedByOtherCore) throw new Error('端口已被其他核心使用')
   } catch (error) {
     showToast(readableError(error, '核心设置无效'))
+    finishCoreMutation(core.id)
     return
   }
 
-  coreMutationPending.value = true
   try {
     const response = await updateCore(core.id, { name, controllerPort, mixedPort })
     cores.value = cores.value.map((item) => item.id === response.core.id ? response.core : item)
@@ -662,7 +721,7 @@ async function saveCoreDraft(core: CoreSummary) {
   } catch (error) {
     showToast(readableError(error, '核心修改保存失败，已保持原配置'))
   } finally {
-    coreMutationPending.value = false
+    finishCoreMutation(core.id)
   }
 }
 
@@ -698,6 +757,11 @@ async function loadProxyData(showToastMessages = true): Promise<boolean> {
   } finally {
     if (requestId === proxyLoadRequestId) proxyLoadingInstanceId = ''
   }
+}
+
+function selectCoreFromCard(event: MouseEvent, instanceId: MihomoInstanceId) {
+  if (event.target instanceof Element && event.target.closest('button, input, label')) return
+  void selectInstance(instanceId)
 }
 
 async function selectInstance(instanceId: MihomoInstanceId) {
@@ -894,7 +958,7 @@ async function applyProfileToActiveCore(profileId: string): Promise<{ coreName: 
   if (!core) {
     throw new Error('请先在顶部选择核心')
   }
-  if (coreMutationPending.value) {
+  if (coreMutationPending.value || isCoreMutationPending(core.id)) {
     throw new Error('核心正在切换，请稍候')
   }
   if (core.profileId === profileId) {
@@ -989,8 +1053,7 @@ async function handleProfileFile(event: Event) {
     const content = await file.text()
     const name = file.name.replace(/\.(ya?ml)$/i, '') || '本地配置'
     const response = await importProfile(name, content)
-    profiles.value = [...profiles.value.filter((profile) => profile.id !== response.profile.id), response.profile]
-    selectedProfile.value = response.profile.id
+    await applyImportedProfileResult(response)
     profileStatus.value = 'idle'
     showToast(`${response.profile.name} 已导入配置库`)
   } catch (error) {
@@ -1018,8 +1081,7 @@ async function submitSubscription() {
   profileError.value = ''
   try {
     const response = await addSubscription(subscriptionName.value.trim(), subscriptionUrl.value.trim())
-    profiles.value = [...profiles.value.filter((profile) => profile.id !== response.profile.id), response.profile]
-    selectedProfile.value = response.profile.id
+    await applyImportedProfileResult(response)
     showSubscriptionDialog.value = false
     profileStatus.value = 'idle'
     try {
@@ -1311,7 +1373,7 @@ function windowAction(label: string) {
       <symbol id="icon-nav-logs" viewBox="0 0 24 24"><path d="M5 6h14M5 12h14M5 18h14" /></symbol>
       <symbol id="icon-nav-connections" viewBox="0 0 24 24"><path d="M8.5 8.5 15.5 15.5M6.5 14.5l-2 2a3.2 3.2 0 0 0 4.5 4.5l2-2M17.5 9.5l2-2A3.2 3.2 0 0 0 15 3l-2 2" /></symbol>
       <symbol id="icon-nav-settings" viewBox="0 0 24 24"><path d="m12 3 1.3 2.2 2.5.7 2.2-1.1 1.2 1.2-1.1 2.2.7 2.5L21 12l-2.2 1.3-.7 2.5 1.1 2.2-1.2 1.2-2.2-1.1-2.5.7L12 21l-1.3-2.2-2.5-.7-2.2 1.1-1.2-1.2 1.1-2.2-.7-2.5L3 12l2.2-1.3.7-2.5-1.1-2.2L6 4.8l2.2 1.1 2.5-.7L12 3Z" /><circle cx="12" cy="12" r="3" /></symbol>
-      <symbol id="icon-nav-feedback" viewBox="0 0 24 24"><path d="M5 5.5h14v10H11l-4 3v-3H5v-10Z" /><path d="M8.5 9.5h7M8.5 12.5h4" /></symbol>
+      <symbol id="icon-nav-about" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9" /><path d="M12 10.8v5.4M12 7.7h.01" /></symbol>
       <symbol id="icon-terminal" viewBox="0 0 24 24"><path d="M4 5h16v14H4V5Zm3 4 3 3-3 3M12.5 15H17" /></symbol>
       <symbol id="icon-muted" viewBox="0 0 24 24"><path d="m5 5 14 14M9 9l3-3 3 3v5l-2 2M5 12h3" /></symbol>
       <symbol id="icon-lan" viewBox="0 0 24 24"><circle cx="12" cy="5" r="2" /><circle cx="6" cy="18" r="2" /><circle cx="18" cy="18" r="2" /><path d="M12 7v5M12 12H6v4M12 12h6v4" /></symbol>
@@ -1371,7 +1433,7 @@ function windowAction(label: string) {
             <circle class="cat-eye" cx="75" cy="51" r="4.8" />
             <path class="cat-mouth" d="M56 62c3 3 7 3 10 0M61 62v5" />
           </svg>
-          <div class="brand-title">OhMyClash <span>v0.1.0</span></div>
+          <div class="brand-title">OhMyClash <span>v{{ APP_VERSION }}</span></div>
         </section>
 
         <section v-if="activePage === 'general'" class="settings-list" aria-label="常规设置">
@@ -1455,16 +1517,16 @@ function windowAction(label: string) {
         <section v-else-if="activePage === 'cores'" class="screen-page">
           <div class="screen-heading"><div><h2>核心</h2><p>多个 Mihomo 核心并行运行，系统代理仅绑定其中一个核心；名称和端口修改后统一保存</p></div><button class="page-button" @click="coreProfileId = profiles[0]?.id ?? ''; showCoreDialog = true">创建核心</button></div>
           <div class="core-list">
-            <article v-for="core in cores" :key="core.id" class="core-card" :class="{ active: activeInstanceId === core.id }" @contextmenu.prevent="openContextMenu($event, 'core', core.id)">
+            <article v-for="core in cores" :key="core.id" class="core-card" :class="{ active: activeInstanceId === core.id }" @click="selectCoreFromCard($event, core.id)" @contextmenu.prevent="openContextMenu($event, 'core', core.id)">
               <div class="core-card-heading"><button @click="selectInstance(core.id)"><strong>{{ core.name }}</strong><small>{{ profiles.find((profile) => profile.id === core.profileId)?.name ?? core.profileId }}</small></button><span>{{ core.mixedPort }}</span></div>
-              <label class="core-input-row"><span>名称</span><input :value="coreDraft(core).name" maxlength="80" autocomplete="off" @input="updateCoreDraft(core, 'name', $event)" @keydown.enter.prevent="saveCoreDraft(core)" @keydown.esc="resetCoreDraft(core)" /></label>
-              <label class="core-input-row"><span>控制端口</span><input :value="coreDraft(core).controllerPort" type="text" inputmode="numeric" autocomplete="off" @input="updateCoreDraft(core, 'controllerPort', $event)" @keydown.enter.prevent="saveCoreDraft(core)" @keydown.esc="resetCoreDraft(core)" /></label>
-              <label class="core-input-row"><span>混合端口</span><input :value="coreDraft(core).mixedPort" type="text" inputmode="numeric" autocomplete="off" @input="updateCoreDraft(core, 'mixedPort', $event)" @keydown.enter.prevent="saveCoreDraft(core)" @keydown.esc="resetCoreDraft(core)" /></label>
-              <div class="core-port-actions"><span v-if="coreDraftDirty(core)">名称或端口修改尚未保存</span><button class="core-port-save" :disabled="coreMutationPending || !coreDraftDirty(core)" @click.stop="saveCoreDraft(core)">{{ coreMutationPending ? '保存中…' : '保存修改' }}</button></div>
-              <div class="core-setting-row"><span>允许局域网</span><button @click="patchCore(core, { allowLan: !core.allowLan })"><span class="switch" :class="{ on: core.allowLan }"><i /></span></button></div>
-              <div class="core-setting-row"><span>IPv6</span><button @click="patchCore(core, { ipv6: !core.ipv6 })"><span class="switch" :class="{ on: core.ipv6 }"><i /></span></button></div>
-              <div class="core-setting-row"><span>TUN 模式</span><button @click="patchCore(core, { tunEnabled: !core.tunEnabled })"><span class="switch" :class="{ on: core.tunEnabled }"><i /></span></button></div>
-              <div class="core-setting-row"><span>系统代理<small v-if="systemProxyCoreId === core.id">当前绑定</small><small v-else-if="systemProxyCoreId">其他核心已绑定</small></span><button :disabled="coreMutationPending || systemProxyPendingCoreId !== null" @click.stop="toggleCoreSystemProxy(core.id)"><span class="switch" :class="{ on: systemProxyCoreId === core.id }"><i /></span></button></div>
+              <label class="core-input-row"><span>名称</span><input :value="coreDraft(core).name" :disabled="isCoreMutationPending(core.id)" maxlength="80" autocomplete="off" @input="updateCoreDraft(core, 'name', $event)" @keydown.enter.prevent="saveCoreDraft(core)" @keydown.esc="resetCoreDraft(core)" /></label>
+              <label class="core-input-row"><span>控制端口</span><input :value="coreDraft(core).controllerPort" :disabled="isCoreMutationPending(core.id)" type="text" inputmode="numeric" autocomplete="off" @input="updateCoreDraft(core, 'controllerPort', $event)" @keydown.enter.prevent="saveCoreDraft(core)" @keydown.esc="resetCoreDraft(core)" /></label>
+              <label class="core-input-row"><span>混合端口</span><input :value="coreDraft(core).mixedPort" :disabled="isCoreMutationPending(core.id)" type="text" inputmode="numeric" autocomplete="off" @input="updateCoreDraft(core, 'mixedPort', $event)" @keydown.enter.prevent="saveCoreDraft(core)" @keydown.esc="resetCoreDraft(core)" /></label>
+              <div class="core-port-actions"><span v-if="coreDraftDirty(core)">名称或端口修改尚未保存</span><button class="core-port-save" :disabled="coreMutationPending || isCoreMutationPending(core.id) || !coreDraftDirty(core)" @click.stop="saveCoreDraft(core)">{{ isCoreMutationPending(core.id) ? '保存中…' : '保存修改' }}</button></div>
+              <div class="core-setting-row"><span>允许局域网</span><button :disabled="coreMutationPending || isCoreMutationPending(core.id)" @click="patchCore(core, { allowLan: !core.allowLan })"><span class="switch" :class="{ on: core.allowLan }"><i /></span></button></div>
+              <div class="core-setting-row"><span>IPv6</span><button :disabled="coreMutationPending || isCoreMutationPending(core.id)" @click="patchCore(core, { ipv6: !core.ipv6 })"><span class="switch" :class="{ on: core.ipv6 }"><i /></span></button></div>
+              <div class="core-setting-row"><span>TUN 模式</span><button :disabled="coreMutationPending || isCoreMutationPending(core.id)" @click="patchCore(core, { tunEnabled: !core.tunEnabled })"><span class="switch" :class="{ on: core.tunEnabled }"><i /></span></button></div>
+              <div class="core-setting-row"><span>系统代理<small v-if="systemProxyCoreId === core.id">当前绑定</small><small v-else-if="systemProxyCoreId">其他核心已绑定</small></span><button :disabled="coreMutationPending || isCoreMutationPending(core.id) || systemProxyPendingCoreId !== null" @click.stop="toggleCoreSystemProxy(core.id)"><span class="switch" :class="{ on: systemProxyCoreId === core.id }"><i /></span></button></div>
             </article>
           </div>
         </section>
@@ -1495,6 +1557,8 @@ function windowAction(label: string) {
             <button class="simple-setting setting-control" @click="toggleTrayOnClose"><div><strong>状态栏常驻</strong><small>关闭窗口后隐藏到系统托盘，核心继续运行</small></div><span class="switch" :class="{ on: trayOnCloseEnabled }"><i /></span></button>
           </div>
         </section>
+
+        <AboutPage v-else-if="activePage === 'about'" />
 
         <section v-else class="empty-page">
           <div class="empty-mark"><svg class="empty-icon"><use :href="`#icon-${navItems.find((item) => item.id === activePage)?.icon}`" /></svg></div>
