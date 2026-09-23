@@ -8,6 +8,7 @@ from urllib.parse import parse_qsl, unquote, urlsplit
 
 from .app_runtime import ManagedRuntime
 from .mihomo_manager import ControllerError, ManagerError, MihomoManager
+from .traffic_stats import HourlyTrafficStats
 from .windows_proxy import set_system_proxy, system_proxy_status
 from .logging_config import get_logger
 
@@ -17,6 +18,25 @@ logger = get_logger("api")
 
 class BackendHandler(BaseHTTPRequestHandler):
     server: "BackendServer"
+
+    def _start_core(self, core: dict[str, Any]) -> None:
+        runtime = self.server.runtime
+        if runtime is None:
+            raise ManagerError("managed runtime is not configured")
+        try:
+            self.server.manager.add_instance(runtime.build_instance(core["id"]))
+        except Exception:
+            logger.exception("new core startup failed; rolling back core=%s", core["id"])
+            try:
+                runtime.delete_core(core["id"])
+            except Exception:
+                logger.exception("failed to roll back core=%s", core["id"])
+            raise
+        if self.server.traffic_stats is not None:
+            try:
+                self.server.traffic_stats.sample_instance(core["id"])
+            except Exception:
+                logger.exception("initial traffic sample failed after core startup core=%s", core["id"])
 
     def do_OPTIONS(self) -> None:  # noqa: N802
         self.send_response(204)
@@ -48,6 +68,12 @@ class BackendHandler(BaseHTTPRequestHandler):
             if path == "/api/instances" and method == "GET":
                 self._json(200, {"instances": self.server.manager.statuses()})
                 return
+            if path == "/api/stats/hourly" and method == "GET":
+                if self.server.traffic_stats is None:
+                    self._json(503, {"error": "managed runtime is not configured"})
+                    return
+                self._json(200, self.server.traffic_stats.daily(query.get("date")))
+                return
 
             if path == "/api/profiles" and method == "GET":
                 self._json(200, {"profiles": self.server.runtime.profile_infos()})
@@ -76,16 +102,7 @@ class BackendHandler(BaseHTTPRequestHandler):
                 with self.server.lifecycle_lock:
                     payload = self._read_json_object()
                     core = self.server.runtime.create_core(self._required_string(payload, "name"), self._required_string(payload, "profileId"))
-                    try:
-                        spec = self.server.runtime.build_instance(core["id"])
-                        self.server.manager.add_instance(spec)
-                    except Exception:
-                        logger.exception("new core startup failed; rolling back core=%s", core["id"])
-                        try:
-                            self.server.runtime.delete_core(core["id"])
-                        except Exception:
-                            logger.exception("failed to roll back core=%s", core["id"])
-                        raise
+                    self._start_core(core)
                     self._json(200, {"core": core, "instances": self.server.manager.statuses()})
                 return
             if path == "/api/profiles/import" and method == "POST":
@@ -95,7 +112,14 @@ class BackendHandler(BaseHTTPRequestHandler):
                         self._required_string(payload, "name"),
                         self._required_string(payload, "content"),
                     )
-                    self._json(200, {"profile": profile, "instances": self.server.manager.statuses()})
+                    core = self.server.runtime.ensure_default_core(profile["id"])
+                    if core is not None:
+                        logger.info("first profile imported; starting the default core")
+                        self._start_core(core)
+                    response: dict[str, Any] = {"profile": profile, "instances": self.server.manager.statuses()}
+                    if core is not None:
+                        response["core"] = core
+                    self._json(200, response)
                 return
             if path == "/api/profiles/subscribe" and method == "POST":
                 with self.server.lifecycle_lock:
@@ -104,7 +128,14 @@ class BackendHandler(BaseHTTPRequestHandler):
                         self._required_string(payload, "name"),
                         self._required_string(payload, "url"),
                     )
-                    self._json(200, {"profile": profile, "instances": self.server.manager.statuses()})
+                    core = self.server.runtime.ensure_default_core(profile["id"])
+                    if core is not None:
+                        logger.info("first subscription imported; starting the default core")
+                        self._start_core(core)
+                    response: dict[str, Any] = {"profile": profile, "instances": self.server.manager.statuses()}
+                    if core is not None:
+                        response["core"] = core
+                    self._json(200, response)
                 return
 
             parts = path.split("/")
@@ -136,6 +167,7 @@ class BackendHandler(BaseHTTPRequestHandler):
                 with self.server.lifecycle_lock:
                     core_id = unquote(parts[3])
                     previous_cores = self.server.runtime.list_cores()
+                    previous_manager = self.server.manager
                     proxy_status = system_proxy_status()
                     proxy_core_id = self.server.runtime.core_id_for_proxy_server(proxy_status["server"]) if proxy_status["enabled"] else None
                     catalog_updated = False
@@ -152,20 +184,25 @@ class BackendHandler(BaseHTTPRequestHandler):
                                 self.server.runtime.restore_cores(previous_cores)
                             except Exception:
                                 logger.exception("failed to restore core catalog after update failure core=%s", core_id)
-                            try:
-                                self.server.reload_runtime()
-                                if proxy_status["enabled"] and proxy_core_id:
-                                    previous_proxy_core = next((item for item in previous_cores if item.id == proxy_core_id), None)
-                                    if previous_proxy_core:
-                                        set_system_proxy(True, previous_proxy_core.mixed_port)
-                            except Exception:
-                                logger.exception("failed to restore runtime after core update failure core=%s", core_id)
+                            if self.server.manager is not previous_manager or previous_manager.is_closed:
+                                try:
+                                    self.server.reload_runtime()
+                                    if proxy_status["enabled"] and proxy_core_id:
+                                        previous_proxy_core = next((item for item in previous_cores if item.id == proxy_core_id), None)
+                                        if previous_proxy_core:
+                                            set_system_proxy(True, previous_proxy_core.mixed_port)
+                                except Exception:
+                                    logger.exception("failed to restore runtime after core update failure core=%s", core_id)
+                            else:
+                                logger.info("core update preflight failed; existing runtime remains active core=%s", core_id)
                         raise
                     self._json(200, {"core": core, "instances": instances})
                 return
             if len(parts) == 4 and parts[1:3] == ["api", "cores"] and method == "DELETE":
                 with self.server.lifecycle_lock:
                     core_id = unquote(parts[3])
+                    if self.server.traffic_stats is not None:
+                        self.server.traffic_stats.sample_instance(core_id, final=True)
                     proxy_status = system_proxy_status()
                     if proxy_status["enabled"] and self.server.runtime.core_id_for_proxy_server(proxy_status["server"]) == core_id:
                         core = self.server.runtime.get_core(core_id)
@@ -204,7 +241,11 @@ class BackendHandler(BaseHTTPRequestHandler):
             if method == "POST" and tail in {"/start", "/stop", "/restart"}:
                 with self.server.lifecycle_lock:
                     action = tail[1:]
+                    if action in {"stop", "restart"} and self.server.traffic_stats is not None:
+                        self.server.traffic_stats.sample_instance(instance_id, final=True)
                     result = getattr(self.server.manager, action)(instance_id)
+                    if action in {"start", "restart"} and self.server.traffic_stats is not None:
+                        self.server.traffic_stats.sample_instance(instance_id)
                     self._json(200, result)
                 return
             if method == "GET" and tail == "/status":
@@ -293,6 +334,7 @@ class BackendServer(ThreadingHTTPServer):
         self._closing = threading.Event()
         self._shutdown_lock = threading.Lock()
         self._shutdown_started = False
+        self.traffic_stats = HourlyTrafficStats(runtime.data_dir, self) if runtime is not None else None
 
     def reload_runtime(self) -> list[dict[str, Any]]:
         if self.runtime is None:
@@ -304,9 +346,15 @@ class BackendServer(ThreadingHTTPServer):
                 raise ManagerError("backend is shutting down")
             generation = self._runtime_generation + 1
             logger.info("runtime reload started generation=%s", generation)
+            try:
+                new_manager = self.runtime.build_manager()
+            except Exception:
+                logger.exception("runtime reload preflight failed; existing cores remain active generation=%s", generation)
+                raise
+            if self.traffic_stats is not None:
+                self.traffic_stats.sample_all(final=True)
             old_manager = self.manager
             old_manager.close()
-            new_manager = self.runtime.build_manager()
             try:
                 new_manager.start_autostart()
                 new_manager.wait_for_ready()
@@ -316,6 +364,8 @@ class BackendServer(ThreadingHTTPServer):
                 raise
             self.manager = new_manager
             self._runtime_generation = generation
+            if self.traffic_stats is not None:
+                self.traffic_stats.sample_all()
             logger.info("runtime reload completed generation=%s instances=%s", generation, new_manager.instance_ids)
             return new_manager.statuses()
 
@@ -335,6 +385,8 @@ class BackendServer(ThreadingHTTPServer):
             try:
                 self.server_close()
             finally:
+                if self.traffic_stats is not None:
+                    self.traffic_stats.close()
                 with self.lifecycle_lock:
                     self.manager.close()
                 logger.info("runtime shutdown completed")

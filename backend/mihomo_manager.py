@@ -109,6 +109,11 @@ class MihomoManager:
     def instance_ids(self) -> list[str]:
         return list(self._specs)
 
+    @property
+    def is_closed(self) -> bool:
+        with self._lock:
+            return self._closed
+
     def start_autostart(self) -> None:
         for spec in self._specs.values():
             if spec.autostart:
@@ -299,6 +304,7 @@ class MihomoManager:
         path: str,
         query: dict[str, str] | None = None,
         payload: Any | None = None,
+        timeout: float = 15,
     ) -> tuple[int, dict[str, str], bytes]:
         spec = self._get_spec(instance_id)
         split = urlsplit(spec.controller_url)
@@ -313,7 +319,7 @@ class MihomoManager:
 
         request = Request(target, method=method.upper(), data=body, headers=headers)
         try:
-            with urlopen(request, timeout=15) as response:
+            with urlopen(request, timeout=timeout) as response:
                 return response.status, dict(response.headers.items()), response.read()
         except HTTPError as exc:
             raise ControllerError(exc.code, exc.read(), dict(exc.headers.items())) from exc

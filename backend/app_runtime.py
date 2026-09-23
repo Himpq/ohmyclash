@@ -19,9 +19,11 @@ from urllib.request import Request, urlopen
 
 import yaml
 
+from .logging_config import get_logger
 from .mihomo_manager import InstanceSpec, ManagerError, MihomoManager
 
 
+logger = get_logger("runtime")
 BUNDLED_GEOIP_METADB_SHA256 = "6eef2fedc2dae7091c112be13895968135ec01e702df2f5b4b1161b07d714720"
 
 
@@ -95,28 +97,39 @@ class ManagedRuntime:
         self.instance_dir.mkdir(parents=True, exist_ok=True)
 
     def build_manager(self) -> MihomoManager:
-        cores = self.list_cores(migrate=True)
+        self.ensure_default_core()
+        cores = self.list_cores()
         if not cores:
+            logger.info("no saved cores or profiles are available; waiting for the first profile import")
+            return MihomoManager([])
+        profiles = {profile.id: profile for profile in self.list_profiles()}
+        active_cores = [core for core in cores if core.profile_id in profiles]
+        if not active_cores:
+            logger.warning("saved core configurations do not reference an available profile; no Mihomo instances will start")
             return MihomoManager([])
         core_path = CoreLocator(self.project_root).locate()
-        profiles = {profile.id: profile for profile in self.list_profiles()}
-        specs = [self._prepare_instance(core, profiles[core.profile_id], core_path) for core in cores if core.profile_id in profiles]
-        return MihomoManager(specs)
+        managed_mixed_ports = {core.mixed_port: core.id for core in active_cores}
+        prepared = [
+            self._prepare_instance(core, profiles[core.profile_id], core_path, managed_mixed_ports)
+            for core in active_cores
+        ]
+        manager = MihomoManager([spec for spec, _, _ in prepared])
+        self._write_prepared_instances(prepared)
+        return manager
 
     def build_instance(self, core_id: str) -> InstanceSpec:
         core = self.get_core(core_id)
         profile = self._find_profile(core.profile_id)
         core_path = CoreLocator(self.project_root).locate()
-        return self._prepare_instance(core, profile, core_path)
+        cores = self.list_cores()
+        managed_mixed_ports = {item.mixed_port: item.id for item in cores}
+        prepared = self._prepare_instance(core, profile, core_path, managed_mixed_ports)
+        self._write_prepared_instances([prepared])
+        return prepared[0]
 
-    def list_cores(self, migrate: bool = False) -> list[ManagedCore]:
+    def list_cores(self) -> list[ManagedCore]:
         if not self.cores_path.is_file():
-            if migrate:
-                profiles = self.list_profiles()
-                if profiles:
-                    self.create_core("默认核心", profiles[0].id)
-            if not self.cores_path.is_file():
-                return []
+            return []
         try:
             raw = json.loads(self.cores_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as exc:
@@ -136,18 +149,30 @@ class ManagedRuntime:
             self._save_cores(cores)
         return cores
 
+    def ensure_default_core(self, profile_id: str | None = None) -> dict[str, Any] | None:
+        if self.list_cores():
+            return None
+        profiles = self.list_profiles()
+        if not profiles:
+            return None
+        selected_profile_id = profile_id or profiles[0].id
+        self._find_profile(selected_profile_id)
+        core = self.create_core("默认核心", selected_profile_id)
+        logger.info("default core configuration created")
+        return core
+
     def core_infos(self) -> list[dict[str, Any]]:
-        return [self._core_info(core) for core in self.list_cores(migrate=True)]
+        return [self._core_info(core) for core in self.list_cores()]
 
     def get_core(self, core_id: str) -> ManagedCore:
-        core = next((item for item in self.list_cores(migrate=True) if item.id == core_id), None)
+        core = next((item for item in self.list_cores() if item.id == core_id), None)
         if core is None:
             raise ManagerError(f"core not found: {core_id}")
         return core
 
     def core_id_for_proxy_server(self, server: str) -> str | None:
         normalized = server.strip().lower()
-        for core in self.list_cores(migrate=True):
+        for core in self.list_cores():
             expected = f"127.0.0.1:{core.mixed_port}"
             if normalized == expected or expected in {part.strip() for part in normalized.split(";")}:
                 return core.id
@@ -352,7 +377,7 @@ class ManagedRuntime:
 
     def delete_profile(self, profile_id: str) -> dict[str, Any]:
         profile = self._find_profile(profile_id)
-        users = [core.name for core in self.list_cores(migrate=True) if core.profile_id == profile_id]
+        users = [core.name for core in self.list_cores() if core.profile_id == profile_id]
         if users:
             raise ManagerError(f"配置正被核心使用: {', '.join(users)}")
         profile.source_path.unlink()
@@ -513,7 +538,13 @@ class ManagedRuntime:
             raise ManagerError(f"profile must contain a YAML object: {profile.source_path}")
         return self.normalize_core_mode(source.get("mode", "rule"))
 
-    def _prepare_instance(self, core: ManagedCore, profile: ManagedProfile, core_path: Path) -> InstanceSpec:
+    def _prepare_instance(
+        self,
+        core: ManagedCore,
+        profile: ManagedProfile,
+        core_path: Path,
+        managed_mixed_ports: dict[int, str],
+    ) -> tuple[InstanceSpec, str, str]:
         source = yaml.safe_load(profile.source_path.read_text(encoding="utf-8"))
         if not isinstance(source, dict):
             raise ManagerError(f"profile must contain a YAML object: {profile.source_path}")
@@ -565,7 +596,13 @@ class ManagedRuntime:
                 *(str(item) for item in configured_exclusions),
                 *self._proxy_endpoint_exclusions(generated),
             ]))
-            bypass_rules = self._local_proxy_process_rules(generated)
+            bypass_rules = self._local_proxy_process_rules(
+                generated,
+                core_id=core.id,
+                mixed_port=mixed_port,
+                managed_mixed_ports=managed_mixed_ports,
+                managed_process_name=core_path.stem,
+            )
             configured_rules = generated.get("rules") or []
             if not isinstance(configured_rules, list):
                 raise ManagerError("rules must be an array")
@@ -573,8 +610,18 @@ class ManagedRuntime:
         generated["tun"] = tun
 
         config_path = runtime_dir / "config.yaml"
-        config_path.write_text(yaml.safe_dump(generated, allow_unicode=True, sort_keys=False), encoding="utf-8")
-        metadata_path.write_text(
+        metadata_path = runtime_dir / "runtime.json"
+        return (
+            InstanceSpec(
+                id=core.id,
+                name=core.name,
+                core_path=core_path,
+                home_dir=runtime_dir,
+                config_path=config_path,
+                controller_url=f"http://127.0.0.1:{controller_port}",
+                secret=secret,
+            ),
+            yaml.safe_dump(generated, allow_unicode=True, sort_keys=False),
             json.dumps(
                 {
                     "profileId": profile.id,
@@ -586,17 +633,31 @@ class ManagedRuntime:
                 ensure_ascii=False,
                 indent=2,
             ),
-            encoding="utf-8",
         )
-        return InstanceSpec(
-            id=core.id,
-            name=core.name,
-            core_path=core_path,
-            home_dir=runtime_dir,
-            config_path=config_path,
-            controller_url=f"http://127.0.0.1:{controller_port}",
-            secret=secret,
-        )
+
+    @staticmethod
+    def _write_prepared_instances(prepared: list[tuple[InstanceSpec, str, str]]) -> None:
+        staged_files: list[tuple[Path, Path]] = []
+        try:
+            for spec, config_text, metadata_text in prepared:
+                artifacts = (
+                    (spec.config_path, config_text),
+                    (spec.home_dir / "runtime.json", metadata_text),
+                )
+                for destination, content in artifacts:
+                    temporary = destination.with_name(f"{destination.name}.pending")
+                    temporary.write_text(content, encoding="utf-8")
+                    staged_files.append((temporary, destination))
+
+            for temporary, destination in staged_files:
+                temporary.replace(destination)
+        except Exception:
+            for temporary, _ in staged_files:
+                try:
+                    temporary.unlink(missing_ok=True)
+                except OSError:
+                    logger.warning("failed to remove staged runtime file path=%s", temporary)
+            raise
 
     @staticmethod
     def _proxy_endpoint_exclusions(config: dict[str, Any]) -> list[str]:
@@ -610,6 +671,9 @@ class ManagedRuntime:
                 continue
             server = proxy.get("server")
             if not isinstance(server, str):
+                continue
+            if server.strip().lower() == "localhost":
+                exclusions.extend(("127.0.0.1/32", "::1/128"))
                 continue
             try:
                 address = ipaddress.ip_address(server.strip())
@@ -669,7 +733,14 @@ class ManagedRuntime:
         return interface_name
 
     @staticmethod
-    def _local_proxy_process_rules(config: dict[str, Any]) -> list[str]:
+    def _local_proxy_process_rules(
+        config: dict[str, Any],
+        *,
+        core_id: str,
+        mixed_port: int,
+        managed_mixed_ports: dict[int, str],
+        managed_process_name: str,
+    ) -> list[str]:
         if os.name != "nt":
             return []
         proxies = config.get("proxies") or []
@@ -693,6 +764,19 @@ class ManagedRuntime:
         rules: list[str] = []
         creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
         for port in sorted(local_ports):
+            managed_core_id = managed_mixed_ports.get(port)
+            if port == mixed_port and managed_core_id == core_id:
+                raise ManagerError(f"TUN 本地上游端口 {port} 指向当前核心的混合端口，可能造成代理回环")
+            if managed_core_id:
+                logger.info(
+                    "TUN upstream matched managed core endpoint core=%s upstream_core=%s port=%s",
+                    core_id,
+                    managed_core_id,
+                    port,
+                )
+                rules.append(f"PROCESS-NAME,{managed_process_name},DIRECT")
+                continue
+
             command = (
                 f"$connection=Get-NetTCPConnection -State Listen -LocalPort {port} -ErrorAction SilentlyContinue | "
                 "Select-Object -First 1; "
@@ -710,7 +794,13 @@ class ManagedRuntime:
             )
             process_name = result.stdout.strip()
             if result.returncode != 0 or not process_name:
-                raise ManagerError(f"本地上游代理 127.0.0.1:{port} 没有正在监听的进程，无法安全开启 TUN")
+                logger.warning(
+                    "TUN local upstream listener missing; keeping the loopback route excluded and "
+                    "skipping the process bypass rule core=%s port=%s",
+                    core_id,
+                    port,
+                )
+                continue
             executable = process_name if process_name.lower().endswith(".exe") else f"{process_name}.exe"
             rules.append(f"PROCESS-NAME,{executable},DIRECT")
         return list(dict.fromkeys(rules))
