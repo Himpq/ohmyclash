@@ -19,7 +19,7 @@ from desktop.tray import TrayController
 from backend.windows_proxy import set_system_proxy, system_proxy_status
 
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
+PROJECT_ROOT = Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parents[1]
 WEBVIEWUI_ROOT = PROJECT_ROOT / "WebViewUI"
 FRONTEND_URL = "http://127.0.0.1:5173/"
 BACKEND_URL = "http://127.0.0.1:17890"
@@ -137,7 +137,13 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Launch OhMyClash with WebViewUI and Mihomo backend")
     parser.add_argument("--dist", action="store_true", help="open dist/index.html instead of the Vite dev server")
     parser.add_argument("--devtools", action="store_true", help="enable WebView2 devtools")
+    parser.add_argument("--startup", action="store_true", help="mark this launch as a Windows startup launch")
+    parser.add_argument("--startup-task-helper", choices=("install", "remove"), help=argparse.SUPPRESS)
     args = parser.parse_args()
+
+    if args.startup_task_helper:
+        from backend.startup_task import run_helper
+        return run_helper(args.startup_task_helper, PROJECT_ROOT)
 
     if not WEBVIEWUI_ROOT.is_dir():
         raise RuntimeError(f"WebViewUI checkout not found: {WEBVIEWUI_ROOT}")
@@ -150,7 +156,7 @@ def main() -> int:
     backend_server = None
 
     try:
-        if args.dist:
+        if args.dist or getattr(sys, "frozen", False):
             entry_url = str((PROJECT_ROOT / "dist" / "index.html").resolve())
             if not Path(entry_url).is_file():
                 raise FileNotFoundError("dist/index.html does not exist; run npm run build first")
@@ -167,6 +173,14 @@ def main() -> int:
                 super().__init__()
                 self.tray_resident = False
                 self.tray: TrayController | None = None
+
+            def get_start_with_windows(self):
+                from backend.startup_task import task_exists
+                return {"success": True, "enabled": task_exists()}
+
+            def set_start_with_windows(self, enabled):
+                from backend.startup_task import set_enabled
+                return {"success": True, "enabled": set_enabled(bool(enabled), PROJECT_ROOT)}
 
             def set_tray_resident(self, enabled):
                 self.tray_resident = bool(enabled)

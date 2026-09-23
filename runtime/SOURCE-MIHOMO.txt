@@ -1,0 +1,24 @@
+Mihomo Meta - Corresponding Source
+===================================
+
+The portable distribution includes the following Mihomo build:
+
+Version: v1.19.31
+Platform: windows amd64
+Build tag: with_gvisor
+Upstream release commit: ab405ba
+
+Upstream source repository:
+https://github.com/MetaCubeX/mihomo
+
+Corresponding tagged source tree:
+https://github.com/MetaCubeX/mihomo/tree/v1.19.31
+
+Corresponding source archive:
+https://github.com/MetaCubeX/mihomo/archive/refs/tags/v1.19.31.tar.gz
+
+Upstream release page:
+https://github.com/MetaCubeX/mihomo/releases/tag/v1.19.31
+
+The source repository and release page above are the upstream source links
+for the Mihomo executable distributed with this package.

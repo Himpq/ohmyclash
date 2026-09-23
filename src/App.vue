@@ -62,7 +62,7 @@ const ipv6Enabled = ref(false)
 const tunEnabled = ref(false)
 const systemProxyCoreId = ref<string | null>(null)
 const systemProxyPendingCoreId = ref<string | null>(null)
-const startWithWindowsEnabled = ref(true)
+const startWithWindowsEnabled = ref(false)
 const rememberPageEnabled = ref(localStorage.getItem('ohmyclash.rememberPage') !== 'false')
 const trayOnCloseEnabled = ref(localStorage.getItem('ohmyclash.trayResident') === 'true')
 const proxyMode = ref<ProxyMode>('Rule')
@@ -404,8 +404,31 @@ async function toggleCoreSystemProxy(coreId: string) {
   }
 }
 
-function toggleStartWithWindows() {
-  toggleSetting('开机启动', startWithWindowsEnabled)
+async function loadStartWithWindows() {
+  const api = (window as Window & { pywebview?: { api?: { get_start_with_windows?: () => Promise<{ success: boolean; enabled: boolean }> } } }).pywebview?.api
+  if (!api?.get_start_with_windows) return
+  try {
+    const result = await api.get_start_with_windows()
+    startWithWindowsEnabled.value = result.enabled
+  } catch (error) {
+    showToast(readableError(error, '无法读取开机启动状态'))
+  }
+}
+
+async function toggleStartWithWindows() {
+  const next = !startWithWindowsEnabled.value
+  const api = (window as Window & { pywebview?: { api?: { set_start_with_windows?: (value: boolean) => Promise<{ success: boolean; enabled: boolean }> } } }).pywebview?.api
+  if (!api?.set_start_with_windows) {
+    showToast('开机启动仅支持桌面版')
+    return
+  }
+  try {
+    const result = await api.set_start_with_windows(next)
+    startWithWindowsEnabled.value = result.enabled
+    showToast(next ? '开机启动已安装' : '开机启动已卸载')
+  } catch (error) {
+    showToast(readableError(error, '开机启动设置失败'))
+  }
 }
 
 function toggleRememberPage() {
@@ -1225,13 +1248,17 @@ async function closeAllConnections() {
 let liveDataTimer: number | undefined
 let uptimeTimer: number | undefined
 let statusTimer: number | undefined
-const handlePywebviewReady = () => { void initializeTrayResident() }
+const handlePywebviewReady = () => {
+  void initializeTrayResident()
+  void loadStartWithWindows()
+}
 onMounted(() => {
   void loadCores()
   void pollManagedInstances()
   if (activePage.value !== 'general') selectPage(activePage.value)
   window.addEventListener('pywebviewready', handlePywebviewReady)
   void initializeTrayResident()
+  void loadStartWithWindows()
   window.addEventListener('pointerdown', closeContextMenu)
   document.addEventListener('visibilitychange', refreshVisiblePage)
   liveDataTimer = window.setInterval(() => {

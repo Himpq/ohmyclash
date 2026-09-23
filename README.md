@@ -1,6 +1,6 @@
 # OhMyClash
 
-OhMyClash 是一个面向 Windows 的 Mihomo 桌面管理器，提供 Vue 前端、Python 后端和 PyWebView 桌面窗口。它支持本地 YAML、网络订阅、多核心并行运行、代理组管理、延迟测试和系统代理切换。
+OhMyClash 是一个面向 Windows 的 Mihomo 桌面管理器，提供 Vue 前端、Python 后端和 PyWebView 桌面窗口。它支持本地 YAML、远程配置、多核心并行运行、代理组管理、延迟测试和系统代理切换。
 
 ## 特性
 
@@ -20,7 +20,7 @@ desktop/              PyWebView 桌面启动器和托盘逻辑
 src/                  Vue 前端
 WebViewUI/            PyWebView 窗口壳子，Git 子模块
 runtime/core/         本地 Mihomo 核心程序（不提交到 Git）
-data/                 本机配置、订阅、日志和运行时缓存，不提交到 Git
+data/                 本机配置、远程配置、日志和运行时缓存，不提交到 Git
 ```
 
 ## 环境要求
@@ -77,12 +77,12 @@ python -m backend.main
 
 ## 首次使用
 
-1. 在配置页面导入本地 YAML 或添加网络订阅。
+1. 在配置页面导入本地 YAML 或添加远程配置。
 2. 在核心页面创建核心，并为核心选择一个 profile。
 3. 启动核心，进入代理页面选择代理组和节点。
 4. 如需接管系统流量，在目标核心的系统代理开关中启用。
 
-本地配置保存在 `data/`。订阅 URL、控制器密钥、日志和运行时缓存均属于本机状态，不应提交到公共仓库。
+本地配置保存在 `data/`。远程配置地址、控制器密钥、日志和运行时缓存均属于本机状态，不应提交到公共仓库。
 
 ## 开发验证
 
@@ -111,8 +111,8 @@ git submodule update --init --recursive
 
 `.gitignore` 默认排除以下内容：
 
-- `data/` 中的订阅、密钥、日志和运行时缓存
+- `data/` 中的远程配置、密钥、日志和运行时缓存
 - `node_modules/`、`dist/` 和测试输出
 - Python 字节码和本地虚拟环境
 
-提交代码前请检查 `git status --ignored`，确认没有把个人订阅链接、代理凭据或本地日志加入提交。
+提交代码前请检查 `git status --ignored`，确认没有把个人远程配置地址、代理凭据或本地日志加入提交。

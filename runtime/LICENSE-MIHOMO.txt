@@ -1,0 +1,22 @@
+Mihomo Meta
+===========
+
+This distribution includes Mihomo Meta v1.19.31 (windows amd64, built with
+the with_gvisor tag) from the MetaCubeX/mihomo project.
+
+License: GNU General Public License, version 3 (GPL-3.0).
+
+Upstream project and corresponding source links:
+See SOURCE-MIHOMO.txt in this same directory.
+
+Upstream license notice:
+https://github.com/MetaCubeX/mihomo/blob/Meta/LICENSE
+
+The complete GNU GPL version 3 license text is included in
+GPL-3.0-MIHOMO.txt in this same directory. The canonical online copy is:
+https://www.gnu.org/licenses/gpl-3.0.txt
+
+The Mihomo source corresponding to the distributed executable is available
+from the upstream links listed in SOURCE-MIHOMO.txt. This file is included
+with the portable distribution to preserve the third-party license and
+attribution notice.

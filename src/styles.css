@@ -356,7 +356,7 @@ html.wvu-titlebar-ready .cfw-window > .titlebar { display: none; }
   .log-line { min-height: 32px; }
   .connection-line { height: 61px; }
   .simple-setting { min-height: 46px; }
-  .connections-panel { overflow: hidden; }
+  .connections-panel { overflow-x: hidden; overflow-y: auto; scrollbar-gutter: stable; }
   .connection-line { min-width: 0; }
 }
 
